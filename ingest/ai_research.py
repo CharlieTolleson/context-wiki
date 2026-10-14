@@ -12,6 +12,8 @@ Design notes:
   * INDEX.md is rewritten under a hard word cap. That cap is the forcing
     function that makes pruning happen, without it the model appends forever.
   * archive/ is append-only and never pruned, so INDEX.md can prune freely.
+  * Locations: WIKI_DATA_DIR holds INDEX.md and topics/; the archive and state default to
+    the code repo (WIKI_ARCHIVE_DIR, WIKI_STATE_DIR). Settings come from the environment or .env.
   * Topic files: a section over SECTION_SPLIT_WORDS lives in topics/<slug>.md and INDEX.md keeps a
     pointer stub. The merge never sees this; it works on the assembled document (read_wiki).
   * Shrink guard: a merge that keeps too few of the existing claims is retried once and then
@@ -46,20 +48,64 @@ from pathlib import Path
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
-WIKI_DIR = Path(__file__).resolve().parent.parent
+# Where things live. The code is wherever this file is; every location below can be set
+# with an environment variable or a KEY=VALUE line in a .env file at the repo root (real
+# environment variables win). The readable wiki (INDEX.md, topics/) and the raw archive
+# are separate settings on purpose: the wiki is small and worth syncing or indexing in a
+# notes vault, while the archive holds full text of other people's articles and belongs
+# somewhere local that nothing syncs or indexes.
+REPO_DIR = Path(__file__).resolve().parent.parent
+LOCAL_ENV = REPO_DIR / ".env"
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Parse KEY=VALUE lines from a dotenv-style file.
+
+    Only full-line `#` comments are supported (a `#` inside a value is kept, since keys
+    can contain one). One pair of surrounding quotes is stripped. A missing file is empty.
+    """
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]
+            values[key.strip()] = val
+    return values
+
+
+_LOCAL_SETTINGS = _read_env_file(LOCAL_ENV)
+
+
+def setting(name: str, default: str) -> str:
+    """A setting from the environment, else from the repo's .env, else the default."""
+    return os.environ.get(name) or _LOCAL_SETTINGS.get(name) or default
+
+
+WIKI_DIR = Path(setting("WIKI_DATA_DIR", str(REPO_DIR))).expanduser()      # INDEX.md and topics/
 INDEX_PATH = WIKI_DIR / "INDEX.md"
 TOPICS_DIR = WIKI_DIR / "topics"
-ARCHIVE_DIR = WIKI_DIR / "archive"
-STATE_PATH = Path(__file__).resolve().parent / "state.json"
+ARCHIVE_DIR = Path(setting("WIKI_ARCHIVE_DIR", str(REPO_DIR / "archive"))).expanduser()
+STATE_DIR = Path(setting("WIKI_STATE_DIR", str(REPO_DIR / "ingest"))).expanduser()
+STATE_PATH = STATE_DIR / "state.json"
 # Item ids backfill has already shown the merge model (cited or deliberately dropped).
 # Without this, dropped items look "pending" forever and get re-picked every pass.
-REVIEWED_PATH = Path(__file__).resolve().parent / "backfill_reviewed.json"
-# Credentials file for the OpenAI-compatible endpoint. Real environment variables win over it.
-ENV_PATH = Path(os.environ.get("WIKI_ENV_FILE", str(WIKI_DIR / ".env")))
+REVIEWED_PATH = STATE_DIR / "backfill_reviewed.json"
+# Optional separate file for the endpoint credentials, so secrets can live in one shared place.
+ENV_PATH = Path(setting("WIKI_ENV_FILE", str(LOCAL_ENV))).expanduser()
+# "auto": after each run, commit the wiki when its directory is a git repo and the data is not
+# gitignored. "0": never, for when something else (a vault sync job, say) commits that folder.
+GIT_COMMIT = setting("WIKI_GIT_COMMIT", "auto")
 
 LOOKBACK_CAP_DAYS = 14   # clamps backfill after a long outage; tune freely
 WORD_CAP = 2000          # hard cap on INDEX.md, the pruning forcing function (raised from 1200 on 2026-10-07)
-MODEL = os.environ.get("WIKI_MODEL", "claude-sonnet-5")  # any model alias your endpoint serves
+MODEL = setting("WIKI_MODEL", "claude-sonnet-5")  # any model alias your endpoint serves
 MAX_BODY_CHARS = 6000    # per-item cap on archived body text
 MAX_MERGE_ITEMS = 60     # newest N sent to the LLM; archive still gets everything
 MAX_BACKFILL_PASSES = 8  # bound a backfill; quota-capped sources would otherwise
@@ -153,20 +199,19 @@ def log(msg: str) -> None:
 
 
 def load_env() -> dict[str, str]:
-    """Read the OpenAI-compatible endpoint settings from ENV_PATH (real environment variables win)."""
-    import os
+    """Endpoint settings: the environment, then the repo's .env, then ENV_PATH (WIKI_ENV_FILE).
 
-    env: dict[str, str] = {}
-    if ENV_PATH.exists():
-        for line in ENV_PATH.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                env[k.strip()] = v.strip()
-    base = os.environ.get("LITELLM_BASE_URL") or env.get("LITELLM_BASE_URL") or "http://localhost:4000/v1"
-    key = os.environ.get("LITELLM_MASTER_KEY") or env.get("LITELLM_MASTER_KEY", "")
+    Returns:
+        {"base_url": ..., "api_key": ...} for the OpenAI-compatible client.
+
+    Raises:
+        SystemExit: no key is configured anywhere.
+    """
+    shared = _read_env_file(ENV_PATH) if ENV_PATH != LOCAL_ENV else {}
+    base = setting("LITELLM_BASE_URL", "") or shared.get("LITELLM_BASE_URL") or "http://localhost:4000/v1"
+    key = setting("LITELLM_MASTER_KEY", "") or shared.get("LITELLM_MASTER_KEY", "")
     if not key:
-        sys.exit(f"LITELLM_MASTER_KEY not found in the environment or in {ENV_PATH}")
+        sys.exit(f"LITELLM_MASTER_KEY not found in the environment, {LOCAL_ENV}, or {ENV_PATH}")
     return {"base_url": base, "api_key": key}
 
 
@@ -439,6 +484,8 @@ def since_for(state: dict[str, str], name: str, override: datetime | None) -> tu
 # The merge works on ONE document: read_wiki() assembles it and write_wiki() stores
 # it. Where a section physically lives (inline in INDEX.md or in topics/<slug>.md) is
 # a storage detail the prompt, the shrink guard, and the lint never see.
+INDEX_HEADER = ("<!-- Generated by context-wiki (ingest/ai_research.py) from the daily merge. "
+                "Edits here are overwritten on the next run; add knowledge with --add-note. -->")
 TOPIC_MARK = re.compile(r"<!--\s*topic-file:\s*(\S+)\s*-->")
 SECTION_RE = re.compile(r"^## (.+?)[ \t]*$", re.M)
 CLAIM_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) \[")
@@ -483,6 +530,7 @@ def read_wiki() -> str:
         return ""
     preamble, sections = parse_sections(INDEX_PATH.read_text())
     if not sections:
+        preamble = re.sub(r"<!--.*?-->", "", preamble, flags=re.S).strip()   # e.g. only INDEX_HEADER
         return preamble + "\n" if preamble else ""
     parts = []
     for title, body in sections:
@@ -543,7 +591,7 @@ def write_wiki(md: str) -> None:
             index_parts.append(_stub(title, slug, body))
         else:
             index_parts.append(f"## {title}\n\n{body}")
-    _write_if_changed(INDEX_PATH, "\n\n".join(index_parts) + "\n")
+    _write_if_changed(INDEX_PATH, INDEX_HEADER + "\n\n" + "\n\n".join(index_parts) + "\n")
     if TOPICS_DIR.is_dir():
         for stale in TOPICS_DIR.glob("*.md"):
             if stale.name not in keep:
@@ -819,7 +867,7 @@ def merge_index(index_md: str, items: list[Item], creds: dict[str, str],
 # or absorbed) but not most of them in a single pass.
 # A section over this many words moves to topics/<slug>.md and INDEX.md keeps a pointer stub.
 # Once split it stays split until it falls under half this, so files do not flap on and off.
-SECTION_SPLIT_WORDS = int(os.environ.get("WIKI_SECTION_SPLIT_WORDS", "500"))
+SECTION_SPLIT_WORDS = int(setting("WIKI_SECTION_SPLIT_WORDS", "500"))
 MIN_RETAINED = 0.75      # fraction of the starting claims a merge must keep
 GUARD_MIN_CLAIMS = 8     # below this the file is small enough that big swings are normal
 
@@ -1171,10 +1219,11 @@ def add_manual(url: str | None, note: str | None, title: str | None,
 def commit(run_date: str, n_items: int, message: str | None = None) -> None:
     """Commit the wiki's data files so a bad merge is one `git revert` away.
 
-    Only the data files are staged and committed (INDEX.md, archive/, and the two
-    state files), never code and never anything else already staged in the repo.
-    It does nothing when the directory is not a git work tree or when the data is
-    gitignored, which is the layout of the published code repository.
+    Only the data files are staged and committed (INDEX.md, topics/, and, when they
+    live inside the same repo, archive/ and the two state files), never code and never
+    anything else already staged. It does nothing when WIKI_GIT_COMMIT is "0", when the
+    wiki directory is not a git work tree, or when the data is gitignored (the layout of
+    the published code repository).
 
     Args:
         run_date: Date string used in the commit message.
@@ -1184,6 +1233,9 @@ def commit(run_date: str, n_items: int, message: str | None = None) -> None:
     Side effects:
         May create one git commit. Failures are logged, never raised.
     """
+    if GIT_COMMIT.lower() in ("0", "off", "false", "no"):
+        log("git: commits disabled (WIKI_GIT_COMMIT); skipping")
+        return
     paths = [str(p) for p in (INDEX_PATH, ARCHIVE_DIR, TOPICS_DIR, STATE_PATH, REVIEWED_PATH) if p.exists()]
     try:
         inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=WIKI_DIR,
@@ -1191,6 +1243,11 @@ def commit(run_date: str, n_items: int, message: str | None = None) -> None:
         if inside.returncode != 0:
             log("git: not a repository; skipping commit")
             return
+        # The archive and state default to the code repo, outside the wiki's own repo, and git
+        # rejects paths outside its work tree, so only what is inside this one is staged.
+        top = Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=WIKI_DIR,
+                                  capture_output=True, text=True).stdout.strip()).resolve()
+        paths = [p for p in paths if Path(p).resolve().is_relative_to(top)]
         if subprocess.run(["git", "check-ignore", "-q", str(INDEX_PATH)], cwd=WIKI_DIR).returncode == 0:
             log("git: wiki data is gitignored; skipping commit")
             return

@@ -59,7 +59,7 @@ export WIKI_MODEL=your-model-alias        # default: claude-sonnet-5
 
 The variable names say LiteLLM, but any OpenAI-compatible base URL and key work.
 
-The first run looks back 14 days (`LOOKBACK_CAP_DAYS`) and writes `INDEX.md`, `archive/`, and, once a section is large enough, `topics/` in the repo root (all gitignored).
+The first run looks back 14 days (`LOOKBACK_CAP_DAYS`) and writes `INDEX.md`, `archive/`, and, once a section is large enough, `topics/` in the repo root (all gitignored). To write the wiki somewhere else, see [Keeping the wiki in a notes vault](#keeping-the-wiki-in-a-notes-vault).
 
 ## Commands
 
@@ -78,12 +78,17 @@ Manual adds follow exactly the same rules as the scheduled job: the same inclusi
 
 ## Configuration
 
-Environment variables:
+Each setting can be an environment variable or a `KEY=VALUE` line in `.env` at the repo root (gitignored; the environment wins):
 
-| Variable | Default | Purpose |
+| Setting | Default | Purpose |
 |---|---|---|
+| `WIKI_DATA_DIR` | repo root | Where the readable wiki is written: `INDEX.md` and `topics/` |
+| `WIKI_ARCHIVE_DIR` | `archive/` in the repo | The raw archive of fetched articles |
+| `WIKI_STATE_DIR` | `ingest/` in the repo | Watermarks (`state.json`) and the backfill ledger |
 | `WIKI_MODEL` | `claude-sonnet-5` | Model alias used for the merge |
-| `WIKI_ENV_FILE` | `.env` in the repo root | File holding `LITELLM_BASE_URL` and `LITELLM_MASTER_KEY` |
+| `LITELLM_BASE_URL`, `LITELLM_MASTER_KEY` | none | Endpoint and key |
+| `WIKI_ENV_FILE` | the repo `.env` | Optional separate file to read the two endpoint values from, so secrets can stay in one shared place |
+| `WIKI_GIT_COMMIT` | `auto` | `auto` commits the wiki after a run when its folder is a git repo and the data is not ignored; `0` never commits |
 | `WIKI_SECTION_SPLIT_WORDS` | `500` | Section size that moves it into its own topic file |
 
 Constants at the top of `ingest/ai_research.py`:
@@ -98,6 +103,21 @@ Constants at the top of `ingest/ai_research.py`:
 | `HN_QUERIES`, `HN_MIN_POINTS` | 8 topics, 75 | Hacker News is queried by topic, not by front page |
 
 The merge prompt is the `MERGE_SYSTEM` string. Tune it for your own definition of "worth keeping".
+
+## Keeping the wiki in a notes vault
+
+The readable wiki and the raw archive have separate settings so the wiki can live where you already keep notes (an Obsidian vault, for example) while the archive stays local:
+
+```
+# .env
+WIKI_DATA_DIR=~/notes/Resources/Wiki     # INDEX.md and topics/ land here
+WIKI_GIT_COMMIT=0                        # if the vault already has its own sync job that commits
+WIKI_ENV_FILE=~/path/to/shared/.env      # optional: read LITELLM_* from an existing secrets file
+```
+
+Leave `WIKI_ARCHIVE_DIR` out of anything that syncs, indexes, or mirrors the vault: it holds full text of other people's articles, it grows every day, and an embedding pipeline would bury your own notes under it. The default (`archive/` in this repo, gitignored) is a good place.
+
+Do not let two things commit the same folder. If the vault has its own sync job, set `WIKI_GIT_COMMIT=0` so its history becomes the wiki's undo log.
 
 ## Scheduling
 
@@ -130,14 +150,14 @@ Point your agent's standing instructions (for example a `CLAUDE.md`) at the wiki
 ```markdown
 ## Context wiki
 
-`/path/to/context-wiki/INDEX.md` is a maintained knowledge base of current engineering
+`<WIKI_DATA_DIR>/INDEX.md` is a maintained knowledge base of current engineering
 findings, refreshed daily. Read it before researching AI systems, agent architecture,
 retrieval, context engineering, evals, or LLM tooling from scratch, and before reaching
 for web search on those topics.
 
 A large section lives in `topics/<topic>.md`; INDEX.md then shows a one-line pointer for it.
 Open that file when the topic fits your task. Each claim ends with a source, a date, and
-item ids in brackets. For more detail, `grep -rn "<item-id>" /path/to/context-wiki/archive/`
+item ids in brackets. For more detail, `grep -rn "<item-id>" <WIKI_ARCHIVE_DIR>`
 returns the stored article and its URL. Fetch the URL only if the stored body is thin.
 ```
 
@@ -145,7 +165,9 @@ The read path is deliberately tiered so most questions cost few tokens: `INDEX.m
 
 ## Data and git
 
-The data files are gitignored here. After a run the script tries to commit them so a bad merge is one `git revert` away, and it quietly skips when the data is ignored or the directory is not a repository. If you want that history, run from a **private** copy where you remove the data lines from `.gitignore`. Only the data files are ever staged, never code or anything else you have staged.
+The data files are gitignored here. After a run the script tries to commit the wiki so a bad merge is one `git revert` away. It quietly skips when `WIKI_GIT_COMMIT=0`, when the data is ignored, or when the folder is not a repository. Only the data files are ever staged, never code or anything else you have staged, and only those inside the wiki folder's own repo.
+
+To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (or a vault that syncs to one).
 
 ## Tests
 
@@ -153,7 +175,7 @@ The data files are gitignored here. After a run the script tries to commit them 
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, archive de-duplication and re-offering of unmerged items, commit scoping, and the topic-file split (including a round trip and the missing-file safety check).
+They cover the shrink guard and its retry, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, and the topic-file split (including a round trip and the missing-file safety check). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 
