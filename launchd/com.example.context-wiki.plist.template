@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- macOS launchd job: runs the ingester once a day.
+     Fill in the path, then install:
+       mkdir -p logs
+       sed "s#__REPO_DIR__#$PWD#g" launchd/com.example.context-wiki.plist.template \
+         > ~/Library/LaunchAgents/com.example.context-wiki.plist
+       launchctl load ~/Library/LaunchAgents/com.example.context-wiki.plist
+     Fire it once by hand to test:  launchctl start com.example.context-wiki -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.context-wiki</string>
+
+    <!-- caffeinate -i holds an idle-sleep assertion for the life of the run. A laptop that is
+         asleep at the scheduled time starts the job in a brief maintenance wake, and without
+         the assertion it is put back to sleep mid-run: sockets time out and the LLM call
+         finishes hours later. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-i</string>
+        <string>__REPO_DIR__/.venv/bin/python</string>
+        <string>__REPO_DIR__/ingest/ai_research.py</string>
+    </array>
+
+    <!-- Once a day, local time. This is a one-shot job, so no KeepAlive. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+
+    <!-- launchd starts jobs with a minimal PATH; git (used for the optional data commit) needs this. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__REPO_DIR__/logs/context-wiki.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO_DIR__/logs/context-wiki.err</string>
+</dict>
+</plist>

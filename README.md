@@ -1,0 +1,164 @@
+# context-wiki
+
+A small pipeline that keeps a maintained **build manual for AI engineering** and hands it to your coding agents, so they stop re-researching the same ground every session.
+
+Every day it pulls new posts from practitioner feeds, archives each one in full, and makes **one LLM call** that merges what matters into a topic-organized markdown wiki. Agents read that wiki (a few hundred to a couple of thousand tokens) instead of paying to search, fetch, and synthesize again.
+
+The idea: do the expensive work **once, at write time**, and make reading cheap.
+
+> This repository contains the code and the scheduled job only. The wiki it produces (`INDEX.md`, `topics/`, `archive/`) is generated on your machine, stays there, and is gitignored. The archive holds full text of other people's articles, so it should not be published.
+
+## How it works
+
+```
+sources (RSS/Atom, Hacker News, HF papers, Anthropic engineering blog)
+   |   date watermark per source: only items newer than the last successful pull
+   v
+archive/YYYY-MM-DD.md     every item in full, with a stable id like 2026-10-07-sw-03   (append-only)
+   |
+   v   ONE LLM call: current wiki + new items in, complete updated wiki out
+   |   guards: shrink guard (+1 retry), word cap, lint report
+   v
+INDEX.md  +  topics/<topic>.md        what agents read
+```
+
+Design decisions worth knowing:
+
+- **Merge, never append.** Each run rewrites the whole wiki from the current wiki plus new items, so overlapping findings are merged into one claim that cites every source, and superseded claims are replaced. A word cap forces the model to decide what earns its place.
+- **A build manual, not a digest.** The merge prompt only admits a claim if an engineer could act on it while writing code. Funding news, launches, benchmarks-as-marketing, and paper abstracts with no reproducible technique are rejected.
+- **Content-based pruning.** Nothing expires on a timer. A claim leaves only when it is superseded, absorbed into another claim, or no longer decision-relevant.
+- **Greppable ids.** Every claim ends with an attribution (source, date, and item ids in brackets). `grep -rn "<item-id>" archive/` returns the stored article and its URL, so follow-up questions need no network call.
+- **Shrink guard.** A merge that keeps under 75% of the existing claims is retried once with the dropped claims listed, then rejected, leaving the wiki untouched. A model can ignore "the word cap is a ceiling, not a target"; code cannot.
+- **Topic files.** A section over 500 words moves to `topics/<slug>.md` and `INDEX.md` keeps a one-line pointer (claim count, last updated, scope). Small sections stay inline. This is purely storage: the merge always sees one assembled document.
+- **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, and claims that lead with a research-artifact name instead of a practice. Reported, never auto-fixed.
+- **Untrusted input.** Feed titles and bodies are wrapped in an explicit "data, not instructions" block before they reach the model.
+
+## Requirements
+
+- Python 3.10 or newer, and the `openai` package
+- An OpenAI-compatible chat endpoint and a model alias that is good at editing a long document (for example a LiteLLM proxy, or any provider with a compatible API)
+- macOS for the bundled scheduler template; any cron-style scheduler works elsewhere
+
+## Quick start
+
+```bash
+git clone https://github.com/CharlieTolleson/context-wiki.git
+cd context-wiki
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# credentials for your endpoint (read from .env, or from real environment variables)
+cat > .env <<'ENV'
+LITELLM_BASE_URL=http://localhost:4000/v1
+LITELLM_MASTER_KEY=your-key
+ENV
+export WIKI_MODEL=your-model-alias        # default: claude-sonnet-5
+
+.venv/bin/python ingest/ai_research.py --dry-run   # fetch and list what is new; no credentials needed
+.venv/bin/python ingest/ai_research.py             # first real run
+```
+
+The variable names say LiteLLM, but any OpenAI-compatible base URL and key work.
+
+The first run looks back 14 days (`LOOKBACK_CAP_DAYS`) and writes `INDEX.md`, `archive/`, and, once a section is large enough, `topics/` in the repo root (all gitignored).
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `ai_research.py` | Normal daily run: fetch, archive, merge, store |
+| `--dry-run` | Fetch and print what is new. No LLM call, no writes, watermarks unchanged |
+| `--since YYYY-MM-DD` | Override every source's watermark (manual backfill of fetching) |
+| `--backfill` | Merge already-archived items that never reached the wiki, in batches (capped at 8 passes) |
+| `--backfill --since YYYY-MM-DD` | Same, limited to archive items from that run date onward |
+| `--add-url URL [--source NAME]` | Fetch one page by hand and run it through the same archive and merge path |
+| `--add-note TEXT --title TITLE [--source NAME]` | Store a finding that has no URL (something you learned yourself) |
+| `--rebuild-index` | Re-store the wiki through the topic-file layout. No fetching, no LLM call |
+
+Manual adds follow exactly the same rules as the scheduled job: the same inclusion test, merge rules, word cap, and attribution format. Do not edit `INDEX.md` or `topics/` by hand; the next merge will overwrite your edit.
+
+## Configuration
+
+Environment variables:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WIKI_MODEL` | `claude-sonnet-5` | Model alias used for the merge |
+| `WIKI_ENV_FILE` | `.env` in the repo root | File holding `LITELLM_BASE_URL` and `LITELLM_MASTER_KEY` |
+| `WIKI_SECTION_SPLIT_WORDS` | `500` | Section size that moves it into its own topic file |
+
+Constants at the top of `ingest/ai_research.py`:
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `SOURCES` | 11 sources | Add a tuple `(name, two-letter-id, kind, url)`. Kinds: `feed` (RSS or Atom), `hn`, `hf_papers`, `html_index`. The id must be exactly two lowercase letters |
+| `SOURCE_QUOTA` | papers 3, HN 10 | Max items a high-volume source may put in one merge batch |
+| `WORD_CAP` | `2000` | Hard cap on the whole wiki. The merge prompt, lint, and shrink guard all follow it |
+| `LOOKBACK_CAP_DAYS` | `14` | Longest backfill after an outage |
+| `TOPIC_META` | 7 sections | Section titles, file slugs, and one-line scopes. Sections the model invents are handled too |
+| `HN_QUERIES`, `HN_MIN_POINTS` | 8 topics, 75 | Hacker News is queried by topic, not by front page |
+
+The merge prompt is the `MERGE_SYSTEM` string. Tune it for your own definition of "worth keeping".
+
+## Scheduling
+
+**macOS (launchd).** A template is in `launchd/`:
+
+```bash
+mkdir -p logs
+sed "s#__REPO_DIR__#$PWD#g" launchd/com.example.context-wiki.plist.template \
+  > ~/Library/LaunchAgents/com.example.context-wiki.plist
+launchctl load ~/Library/LaunchAgents/com.example.context-wiki.plist
+launchctl start com.example.context-wiki      # fire once now to test
+```
+
+**cron or anything else.** Run the script once a day from the repo root:
+
+```
+0 7 * * * cd /path/to/context-wiki && .venv/bin/python ingest/ai_research.py >> logs/context-wiki.log 2>&1
+```
+
+Things learned the hard way:
+
+- **Sleeping laptops.** A job that fires while the Mac is asleep starts in a short maintenance wake and is put back to sleep mid-run, which shows up as socket timeouts and an LLM call that finishes hours late. The template wraps the job in `caffeinate -i` for this reason.
+- **Missed days heal themselves.** Each source keeps its own watermark and only advances it on success, so a skipped day or a failed source is picked up on the next run (up to `LOOKBACK_CAP_DAYS`).
+- **launchd and time zones.** launchd's calendar scheduler can keep using the time zone it started with. After travelling across zones, a job may fire hours off schedule until you reboot or log out and back in.
+
+## Using the wiki from an agent
+
+Point your agent's standing instructions (for example a `CLAUDE.md`) at the wiki, and say *when* to read it. A bare "this file exists" does not beat an agent's habit of reaching for web search; naming the trigger topics does.
+
+```markdown
+## Context wiki
+
+`/path/to/context-wiki/INDEX.md` is a maintained knowledge base of current engineering
+findings, refreshed daily. Read it before researching AI systems, agent architecture,
+retrieval, context engineering, evals, or LLM tooling from scratch, and before reaching
+for web search on those topics.
+
+A large section lives in `topics/<topic>.md`; INDEX.md then shows a one-line pointer for it.
+Open that file when the topic fits your task. Each claim ends with a source, a date, and
+item ids in brackets. For more detail, `grep -rn "<item-id>" /path/to/context-wiki/archive/`
+returns the stored article and its URL. Fetch the URL only if the stored body is thin.
+```
+
+The read path is deliberately tiered so most questions cost few tokens: `INDEX.md`, then a topic file if a pointer matches, then `grep` an item id in `archive/`, and only then the live URL.
+
+## Data and git
+
+The data files are gitignored here. After a run the script tries to commit them so a bad merge is one `git revert` away, and it quietly skips when the data is ignored or the directory is not a repository. If you want that history, run from a **private** copy where you remove the data lines from `.gitignore`. Only the data files are ever staged, never code or anything else you have staged.
+
+## Tests
+
+```bash
+.venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
+```
+
+They cover the shrink guard and its retry, archive de-duplication and re-offering of unmerged items, commit scoping, and the topic-file split (including a round trip and the missing-file safety check).
+
+## Known limitations
+
+- **Thin feed bodies cannot qualify.** Feeds that only publish a teaser (and link-only Hacker News stories) give the merge nothing to extract a practice from, so they are almost never cited. Fetching full text for those items is not implemented yet.
+- **The HF Daily Papers fetcher filters on each paper's `publishedAt`**, which can be up to two weeks older than the day it was listed, so it currently drops most of the list.
+- **Some sites block scripted fetches.** `openai.com` returns 403 to plain HTTP clients, so those posts rely on the feed teaser.
+- **Merge quality depends on the model.** Lint reports the failures a model keeps making (duplicate ids, artifact-name bullets); it does not fix them.
+- **No license file yet.** Until one is added, the default is all rights reserved.

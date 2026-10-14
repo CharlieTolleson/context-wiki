@@ -1,0 +1,15 @@
+# Local wiki data. All generated, and the archive holds full text of other people's
+# articles, so none of it belongs in a public repository.
+INDEX.md
+topics/
+archive/
+ingest/state.json
+ingest/backfill_reviewed.json
+
+# Local configuration and environments
+.env
+.venv/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
