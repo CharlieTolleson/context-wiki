@@ -125,7 +125,7 @@ Constants at the top of `ingest/ai_research.py`:
 | `ENRICH_LIMIT`, `ENRICH_MIN_BODY` | 40, 500 | Thin items (body under 500 characters) get the linked page fetched, up to 40 per run |
 | `HN_QUERIES`, `HN_MIN_POINTS` | 16 topics, 75 | Hacker News is queried by topic, not by front page |
 
-The merge prompt is the `MERGE_SYSTEM` string. Tune it for your own definition of "worth keeping".
+The merge prompt is the `MERGE_SYSTEM` string. Tune it for your own definition of "worth keeping". Keep its few-shot examples fictional (they use made-up "Acme" names and say so): a real artifact name in an example tends to come back as a wiki claim, cited against whatever item looked closest.
 
 ## Keeping the wiki in a notes vault
 
@@ -198,7 +198,7 @@ To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (o
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip and the missing-file safety check), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
+They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip and the missing-file safety check), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 
