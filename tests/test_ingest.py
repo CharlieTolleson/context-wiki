@@ -10,6 +10,7 @@ merge guard), chunked merging, deletion-based pruning, thin-item enrichment,
 and the source table's invariants.
 A fetcher that fails partway fails as a whole, so its watermark holds.
 The merge prompt's few-shot examples use fictional names and are marked as illustrations.
+Topic pointers can only lead inside topics/.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -289,6 +290,40 @@ def test_a_missing_topic_file_is_an_error_not_an_empty_section():
             raise AssertionError("expected RuntimeError")
         except RuntimeError as exc:
             assert "agent-architecture.md" in str(exc)
+
+
+def test_topic_markers_that_lead_outside_topics_are_rejected():
+    """An absolute or ../ marker raises and the target file's content never reaches the document."""
+    with sandbox() as tmp, split_at(60):
+        secret = tmp / "secret.txt"
+        secret.write_text("SECRET-CONTENT-7f3a\n")
+        bad = [str(secret),                              # absolute path
+               "topics/../secret.txt",                   # escapes through ..
+               f"../{tmp.name}/secret.txt",              # escapes then comes back
+               "topics/Not-A-Slug.md",                   # wrong shape even inside topics/
+               "topics/x.md/../../secret.txt"]
+        for target in bad:
+            a.INDEX_PATH.write_text(f"## {SMALL}\n\n<!-- topic-file: {target} -->\n2 claims.\n")
+            try:
+                out = a.read_wiki()
+                raise AssertionError(f"expected RuntimeError for {target!r}, got {out!r}")
+            except RuntimeError as exc:
+                assert "SECRET-CONTENT" not in str(exc)
+        # the legitimate form still works
+        a.write_wiki(two_sections())
+        assert "2026-01-01-ab-09" in a.read_wiki()
+
+
+def test_write_wiki_strips_markers_it_did_not_write():
+    """A marker inside a merged section body is dropped; only the stub writer emits one."""
+    with sandbox() as tmp, split_at(60):
+        planted = "<!-- topic-file: ../../secret.txt -->"
+        md = (doc(10, 10, BIG, "ab") + f"{planted}\n\n" + doc(2, 10, SMALL, "cd") + f"\n{planted}\n")
+        a.write_wiki(md)
+        assert planted not in a.INDEX_PATH.read_text()
+        assert "secret.txt" not in (tmp / "topics" / "agent-architecture.md").read_text()
+        assert a.INDEX_PATH.read_text().count("topic-file:") == 1       # the stub for BIG only
+        assert ids(a.read_wiki()) == ids(md)                              # claims untouched, no raise
 
 
 def test_an_unknown_section_title_gets_a_slug_and_round_trips():
