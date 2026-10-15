@@ -13,6 +13,7 @@ The merge prompt's few-shot examples use fictional names and are marked as illus
 Topic pointers can only lead inside topics/.
 Lint checks citations against the archive (fabricated ids, changed dates, bodiless sources).
 The merge prompt's untrusted block neutralises delimiter variants and spoofed item headers.
+Small merge batches are quota-capped per source, and the HF papers fetcher selects by listing day.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -21,6 +22,7 @@ Run:  python tests/test_ingest.py        (or: pytest tests/)
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import subprocess
 import sys
@@ -1004,6 +1006,59 @@ def test_fetch_log_prints_the_watermark_time_not_just_its_date():
         assert not any(ln.endswith(f"since {since.date()}") for ln in lines)
     finally:
         a.FETCHERS, a.load_state, sys.argv = saved
+
+
+# ── batch selection and the papers fetcher ──────────────────────────────────
+
+
+def dated_item(source: str, slug: str, n: int, days_ago: int) -> a.Item:
+    """An item from `source` published `days_ago` days back, with a unique URL."""
+    pub = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    return a.Item(source, slug, f"{source} {n}", f"https://x/{source}/{n}", pub, "body")
+
+
+def test_source_quota_applies_to_a_batch_under_the_merge_cap():
+    """A normal day's batch (well under MAX_MERGE_ITEMS) still caps papers at their quota, newest first."""
+    papers = [dated_item("hf-daily-papers", "hf", n, days_ago=n) for n in range(10)]
+    blogs = [dated_item("simon-willison", "sw", n, days_ago=20 + n) for n in range(2)]
+    assert len(papers) + len(blogs) < a.MAX_MERGE_ITEMS
+    picked = a.select_for_merge(blogs + papers)
+    by_source = {}
+    for it in picked:
+        by_source.setdefault(it.source, []).append(it.title)
+    assert by_source["simon-willison"] == ["simon-willison 0", "simon-willison 1"]   # uncapped source: all kept
+    assert by_source["hf-daily-papers"] == ["hf-daily-papers 0", "hf-daily-papers 1", "hf-daily-papers 2"]
+    assert [it.published for it in picked] == sorted((it.published for it in picked), reverse=True)
+
+
+def test_hf_papers_keeps_papers_listed_today_but_published_earlier():
+    """A paper in the watermark day's list is kept although its publishedAt predates the watermark."""
+    since = datetime.now(timezone.utc) - timedelta(days=1)
+    listed_day = since.date().isoformat()
+    published = (since - timedelta(days=10)).replace(microsecond=0)
+    requested: list[str] = []
+
+    def fake_get(url: str) -> bytes:
+        day = url.rsplit("date=", 1)[-1]
+        requested.append(day)
+        if day != listed_day:
+            return b"[]"
+        return json.dumps([{
+            "title": "Old but listed today",
+            "publishedAt": published.isoformat(),
+            "paper": {"id": "2510.01234", "summary": "<p>abstract</p>"},
+        }]).encode()
+
+    real = a.http_get
+    a.http_get = fake_get
+    try:
+        items = a.fetch_hf_papers("hf-daily-papers", "hf", "https://example/api/daily_papers", since)
+    finally:
+        a.http_get = real
+    assert requested[0] == listed_day                       # the loop starts at the watermark day
+    assert [it.url for it in items] == ["https://huggingface.co/papers/2510.01234"]
+    assert items[0].published == published                  # publishedAt is kept for attribution
+    assert items[0].body == "abstract"
 
 
 if __name__ == "__main__":
