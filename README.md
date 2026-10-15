@@ -175,7 +175,7 @@ To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (o
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, and the topic-file split (including a round trip and the missing-file safety check). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
+They cover the shrink guard and its retry, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip and the missing-file safety check), and the date binding of the `html_index` scraper (each article takes the date from its own card). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 

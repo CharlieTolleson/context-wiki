@@ -3,7 +3,8 @@
 
 Covers the parts of the pipeline that protect the wiki from bad merges and bad
 archive writes: the shrink guard and its retry, archive de-duplication and
-re-offering of unmerged items, and the scoping of the automatic git commit.
+re-offering of unmerged items, the scoping of the automatic git commit, the
+topic-file split, and the per-card date binding of the html_index scraper.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -305,6 +306,52 @@ def test_commit_includes_topic_files_and_their_deletion():
         assert "D\ttopics/agent-architecture.md" in git(tmp, "show", "--name-status", "--format=", "HEAD")
 
 
+# ── html index dates ────────────────────────────────────────────────────────
+
+
+def _card(path: str, title: str, date: str) -> str:
+    """One newest-first index card as the Anthropic engineering page lays it out:
+    image link, title link, teaser, then the date. Both links point at the same article."""
+    teaser = "A teaser paragraph about the article. " * 4
+    return (f'<article><a href="{path}"><img alt=""></a>'
+            f'<a href="{path}"><h3>{title}</h3></a><p>{teaser}</p>'
+            f'<span>{date}</span></article>\n')
+
+
+def test_html_index_dates_bind_to_their_own_card():
+    """Each article gets the date from its own card, not the previous (newer) card's date."""
+    cards = [("/engineering/newest", "Newest", "Apr 23, 2026", "2026-04-23"),
+             ("/engineering/middle", "Middle", "Jan 9, 2026", "2026-01-09"),
+             ("/engineering/oldest", "Oldest", "Sep 19, 2024", "2024-09-19")]
+    index_html = "<html><body><nav>Engineering</nav>\n" + "".join(
+        _card(p, t, d) for p, t, d, _ in cards) + "<footer>Copyright 2026</footer></body></html>"
+    prose = "<p>" + ("This sentence is long enough to count as article prose rather than navigation chrome. " * 3) + "</p>"
+    article_html = "<html><body><h1>{title}</h1>" + prose * 3 + "</body></html>"
+
+    def fake_get(url: str) -> bytes:
+        if url == "https://www.anthropic.com/engineering":
+            return index_html.encode()
+        return article_html.format(title=url.rsplit("/", 1)[-1].title()).encode()
+
+    # index_card_dates alone: the pure binding step
+    got = a.index_card_dates(index_html)
+    assert {p: d.date().isoformat() for p, d in got.items()} == {p: iso for p, _, _, iso in cards}
+
+    # and through the fetcher, with the network stubbed and an empty archive
+    real_get, real_archived = a.http_get, a.archived_urls
+    a.http_get, a.archived_urls = fake_get, lambda: set()
+    try:
+        with sandbox():
+            items = a.fetch_html_index("anthropic-eng", "ae", "https://www.anthropic.com/engineering",
+                                       datetime(2000, 1, 1, tzinfo=timezone.utc))
+    finally:
+        a.http_get, a.archived_urls = real_get, real_archived
+    by_url = {i.url: i for i in items}
+    assert len(by_url) == 3
+    for p, title, _, iso in cards:
+        it = by_url["https://www.anthropic.com" + p]
+        assert it.published.date().isoformat() == iso, (p, it.published)
+        assert it.title == title
 
 
 # ── settings and locations ──────────────────────────────────────────────────

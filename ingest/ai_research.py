@@ -382,6 +382,52 @@ ARTICLE_DATE_RE = re.compile(
 )
 
 
+INDEX_LINK_RE = re.compile(r'href="(/engineering/[a-z0-9-]+)"')
+# How far past a link the card's own date may sit. A card is a title, a teaser, and a
+# date; 1200 characters of markup covers that with room to spare.
+CARD_DATE_SPAN = 1200
+
+
+def index_card_dates(index_html: str) -> dict[str, datetime]:
+    """Publication date per article path, read from the cards on a link-index page.
+
+    Each card on the index puts its date AFTER the article link (title, teaser, date),
+    and the cards run newest-first. A date is therefore bound to the link it follows:
+    the search runs forward from the link and stops at the next link to a DIFFERENT
+    article, so it can never read past the end of the card. (A card may link to the
+    same article twice, image plus title, which is why "different" matters.)
+
+    The earlier version searched a window that started 600 characters BEFORE the link,
+    so the first date it met was the previous, newer card's date. Every Anthropic item
+    archived through 2026-10-15 carries the date of the card above it for that reason.
+
+    Args:
+        index_html: The raw HTML of the index page.
+
+    Returns:
+        {"/engineering/<slug>": aware UTC datetime} for every link whose card shows a
+        parseable date. Links with no date in their card are left out, and the caller
+        falls back to scanning the article page.
+    """
+    links = list(INDEX_LINK_RE.finditer(index_html))
+    dates: dict[str, datetime] = {}
+    for i, m in enumerate(links):
+        path = m.group(1)
+        if path in dates:
+            continue
+        end = m.end() + CARD_DATE_SPAN
+        for nxt in links[i + 1:]:
+            if nxt.group(1) != path:
+                end = min(end, nxt.start())
+                break
+        d = ARTICLE_DATE_RE.search(index_html, m.end(), end)
+        if d:
+            parsed = parse_date(f"{d.group(1)} {d.group(2)} {d.group(3)}")
+            if parsed:
+                dates[path] = parsed
+    return dates
+
+
 def archived_urls() -> set[str]:
     """Every URL already recorded in the archive, for sources with no dates."""
     urls: set[str] = set()
@@ -403,20 +449,13 @@ def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[It
     """
     base = "https://www.anthropic.com"
     index_html = http_get(url).decode("utf-8", errors="replace")
-    slugs = sorted(set(re.findall(r'href="(/engineering/[a-z0-9-]+)"', index_html)))
+    slugs = sorted(set(INDEX_LINK_RE.findall(index_html)))
     already = archived_urls()
 
     # The index lists a date beside each link; that is more reliable than
     # scraping the article page, where some posts carry no date at all and the
     # first date-shaped match can belong to an unrelated element.
-    index_dates: dict[str, datetime] = {}
-    for m in re.finditer(r'href="(/engineering/[a-z0-9-]+)"', index_html):
-        window = index_html[max(0, m.start() - 600):m.end() + 1200]
-        d = ARTICLE_DATE_RE.search(window)
-        if d:
-            parsed = parse_date(f"{d.group(1)} {d.group(2)} {d.group(3)}")
-            if parsed and m.group(1) not in index_dates:
-                index_dates[m.group(1)] = parsed
+    index_dates = index_card_dates(index_html)
 
     items: list[Item] = []
     for path in slugs:
