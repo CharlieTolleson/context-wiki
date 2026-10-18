@@ -1751,7 +1751,8 @@ ARTIFACT_ALLOWLIST = {
     "Claude Code",
     "Claude Managed Agents",
     "Contextual Retrieval",   # a named technique, so "Implement Contextual Retrieval" is a practice
-    "Bayesian",               # an adjective, not an artifact
+    # "Bayesian" was listed here as an adjective, but the one live hit ("Utilize Bayesian
+    # reliability memory (BaRe-Mem) ...") is an hf-daily-papers artifact, so it stays reportable.
 }
 
 
@@ -1785,7 +1786,8 @@ def lint_index(md: str, known_ids: set[str],
             the ground truth for citations, so it, not the stored wiki, decides whether an
             id is real. Callers lint after write_wiki, so reading the wiki back here would
             only ever confirm the ids the model just wrote (the fabricated-id check could
-            never fire). None reads the archive now.
+            never fire). None reads the archive now. An empty dict (no archive on disk)
+            skips the id, date, and body checks and logs that it did.
     """
     if facts is None:
         facts = archive_facts()
@@ -1804,33 +1806,39 @@ def lint_index(md: str, known_ids: set[str],
     if dupes:
         problems.append(f"item id(s) cited in >1 bullet (merge rule missed): {', '.join(dupes)}")
 
-    # Ids that are neither in this batch nor anywhere in the archive: the model invented
-    # them (or a hand edit broke one). Every cited id must resolve by grep in the archive.
-    unknown = sorted(set(seen) - known_ids - set(facts))
-    if unknown:
-        problems.append(f"unknown item id(s), possibly fabricated: {', '.join(unknown)}")
+    # The three archive-backed checks need an archive to compare against. A fresh clone
+    # (archive/ is gitignored) or a wrong WIKI_ARCHIVE_DIR has none, and running them
+    # anyway would report every cited id outside the batch as fabricated. Say so instead.
+    if not facts:
+        problems.append("archive empty; id/date/body checks skipped")
+    else:
+        # Ids that are neither in this batch nor anywhere in the archive: the model invented
+        # them (or a hand edit broke one). Every cited id must resolve by grep in the archive.
+        unknown = sorted(set(seen) - known_ids - set(facts))
+        if unknown:
+            problems.append(f"unknown item id(s), possibly fabricated: {', '.join(unknown)}")
 
-    # A claim citing one item must carry that item's published date. A rewrite on
-    # 2026-10-15 silently turned a 2025-01-06 citation into 2026-01-06; a merge that
-    # changes a date it was told to copy is the same failure as inventing an id.
-    # Multi-id claims are skipped: their date is that of the newest source by design.
-    misdated: list[str] = []
-    for b in bullets:
-        cited = set(ID_RE.findall(b))
-        if len(cited) != 1:
-            continue
-        cid = next(iter(cited))
-        m = CLAIM_DATE_RE.search(b)
-        if cid in facts and m and m.group(1) != facts[cid][0]:
-            misdated.append(f"{cid} cited {m.group(1)}, archived {facts[cid][0]}")
-    if misdated:
-        problems.append(f"claim date differs from the archive: {'; '.join(misdated)}")
+        # A claim citing one item must carry that item's published date. A rewrite on
+        # 2026-10-15 silently turned a 2025-01-06 citation into 2026-01-06; a merge that
+        # changes a date it was told to copy is the same failure as inventing an id.
+        # Multi-id claims are skipped: their date is that of the newest source by design.
+        misdated: list[str] = []
+        for b in bullets:
+            cited = set(ID_RE.findall(b))
+            if len(cited) != 1:
+                continue
+            cid = next(iter(cited))
+            m = CLAIM_DATE_RE.search(b)
+            if cid in facts and m and m.group(1) != facts[cid][0]:
+                misdated.append(f"{cid} cited {m.group(1)}, archived {facts[cid][0]}")
+        if misdated:
+            problems.append(f"claim date differs from the archive: {'; '.join(misdated)}")
 
-    # A record with no body gave the merge only a title to work from, so a claim built on
-    # it is a guess. Worth fetching the full text (--add-url) and re-merging.
-    bodiless = sorted(cid for cid in seen if cid in facts and not facts[cid][1])
-    if bodiless:
-        problems.append(f"claim(s) cite an item whose archive record has no body: {', '.join(bodiless)}")
+        # A record with no body gave the merge only a title to work from, so a claim built on
+        # it is a guess. Worth fetching the full text (--add-url) and re-merging.
+        bodiless = sorted(cid for cid in seen if cid in facts and not facts[cid][1])
+        if bodiless:
+            problems.append(f"claim(s) cite an item whose archive record has no body: {', '.join(bodiless)}")
 
     if not [ln for ln in md.splitlines() if ln.startswith("## ")]:
         problems.append("no H2 topic sections found")

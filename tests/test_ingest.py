@@ -889,17 +889,28 @@ def test_artifact_lint_skips_products_styles_and_possessives_and_lists_every_hit
         "- Utilize OpenAI's Dots agents for triage.",
         "- Use Claude Code auto mode to skip approvals.",
         "- Implement Contextual Retrieval with BM25 in RAG systems.",
-        "- Utilize Bayesian reliability memory for advisors.",
         "- Use Claude Managed Agents to host agents.",
+        # The live BaRe-Mem bullet: a paper artifact, so "Bayesian" must not be allowlisted.
+        "- Utilize Bayesian reliability memory (BaRe-Mem) for multi-agent consultation.",
     ] + [f"- Use {h} to do the thing." for h in hits]) + "\n"
     problems = lint_lines(md, set(), {})
     artifact = [p for p in problems if "named artifact" in p]
     assert len(artifact) == 1, problems
-    assert artifact[0].startswith(f"LINT {len(hits)} bullet(s)")
-    for h in hits:
+    assert artifact[0].startswith(f"LINT {len(hits) + 1} bullet(s)")
+    for h in hits + ["Bayesian"]:
         assert h in artifact[0]
-    for fp in ("React", "OpenAI", "Claude", "Contextual", "Bayesian"):
+    for fp in ("React", "OpenAI", "Claude", "Contextual"):
         assert fp not in artifact[0]
+
+
+def test_lint_skips_archive_checks_when_the_archive_is_empty():
+    """With no archive on disk, cited ids are not called fabricated; the skip is logged instead."""
+    md = "## S\n\n- kept - src, 2026-10-01 [2026-09-09-zz-77]\n"
+    problems = lint_lines(md, set(), {})
+    assert any("archive empty" in p and "skipped" in p for p in problems), problems
+    assert not any("fabricated" in p or "date differs" in p or "no body" in p for p in problems), problems
+    with sandbox():                                        # facts=None reads the (empty) archive itself
+        assert any("archive empty" in p for p in lint_lines(md, set(), None))
 
 
 def test_fetch_log_prints_the_watermark_time_not_just_its_date():
