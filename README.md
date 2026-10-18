@@ -70,7 +70,7 @@ The first run looks back 14 days (`LOOKBACK_CAP_DAYS`) and writes `INDEX.md`, `a
 | `--since YYYY-MM-DD` | Override every source's watermark (manual backfill of fetching) |
 | `--backfill` | Merge already-archived items that never reached the wiki, in batches (capped at 8 passes) |
 | `--backfill --since YYYY-MM-DD` | Same, limited to archive items from that run date onward |
-| `--add-url URL [--source NAME]` | Fetch one page by hand and run it through the same archive and merge path |
+| `--add-url URL [--source NAME]` | Fetch one page by hand and run it through the same archive and merge path. Only public `http`/`https` URLs are accepted: `file://` and hosts that resolve to loopback, private, or link-local addresses are refused |
 | `--add-note TEXT --title TITLE [--source NAME]` | Store a finding that has no URL (something you learned yourself) |
 | `--rebuild-index` | Re-store the wiki through the topic-file layout. No fetching, no LLM call |
 

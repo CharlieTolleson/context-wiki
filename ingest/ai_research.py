@@ -31,10 +31,12 @@ from __future__ import annotations
 
 import argparse
 import html
+import ipaddress
 import json
 import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import urllib.error
@@ -228,10 +230,124 @@ def strip_html(raw: str) -> str:
     return text.strip()
 
 
-def http_get(url: str) -> bytes:
+# Upper bound on one HTTP response body. The largest real input is a full Atom
+# feed (simonwillison.net/atom/everything is well under 1 MB); 10 MB leaves lots
+# of headroom while stopping a hostile or broken URL from filling memory. Bodies
+# are cut to MAX_BODY_CHARS after extraction anyway, so nothing useful is lost.
+MAX_FETCH_BYTES = 10 * 1024 * 1024
+
+
+class UnsafeURLError(urllib.error.URLError):
+    """A URL refused before any request is made (bad scheme or a non-public host).
+
+    Subclasses URLError so the fetchers' existing `except URLError` handlers
+    treat it like any other failed fetch instead of crashing the run.
+    """
+
+
+def check_url(url: str, allow_private: bool = True) -> None:
+    """Refuse URLs the ingester must never fetch.
+
+    Only http and https are allowed: urllib would otherwise happily open
+    file:// (reading local secrets such as an .env into the archive and the
+    merge prompt), ftp://, or data: URLs. With allow_private=False, used for
+    the user-supplied --add-url, the host is also resolved and refused if ANY
+    address is loopback, private, link-local, reserved, multicast, or
+    otherwise not globally routable, so a pasted URL cannot reach LiteLLM on
+    localhost:4000 or the 169.254.169.254 metadata service. Checking every
+    getaddrinfo result matters because a name can resolve to one public and
+    one private address. Residual risk: a DNS-rebinding host could answer
+    differently when urlopen resolves it again; acceptable for a personal tool.
+
+    Args:
+        url: The absolute URL about to be fetched (or a redirect target).
+        allow_private: True for the built-in SOURCES (fixed public https
+            URLs); False for URLs a user or agent typed in.
+
+    Raises:
+        UnsafeURLError: the scheme or host is not allowed, or the host does
+            not resolve.
+    """
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise UnsafeURLError(f"refusing {scheme or 'scheme-less'} URL {url!r}: only http and https are fetched")
+    host = parts.hostname
+    if not host:
+        raise UnsafeURLError(f"refusing URL with no host: {url!r}")
+    if allow_private:
+        return
+    try:
+        port = parts.port or (443 if scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except (ValueError, OSError) as exc:  # bad port, or the name does not resolve
+        raise UnsafeURLError(f"cannot resolve {host!r}: {exc}") from exc
+    for info in infos:
+        # IPv6 results can carry a zone suffix ("fe80::1%en0") that ip_address rejects.
+        ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        # ::ffff:127.0.0.1 is loopback in disguise; judge the embedded IPv4 address.
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            ip = mapped
+        if not ip.is_global or ip.is_multicast:
+            raise UnsafeURLError(f"refusing {host!r}: resolves to non-public address {ip}")
+
+
+class _CheckedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Apply check_url to every redirect target, not just the first URL.
+
+    urllib's stock handler already refuses redirects to file:// but still
+    follows ftp://, and it never looks at the host, so a public page could
+    bounce an --add-url fetch to http://localhost. redirect_request receives
+    the already-absolutized target, so checking it here covers both cases.
+    """
+
+    def __init__(self, allow_private: bool):
+        """Args: allow_private: passed through to check_url for each hop."""
+        super().__init__()
+        self.allow_private = allow_private
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Check the redirect target, then defer to the stock handler.
+
+        Raises:
+            UnsafeURLError: the target scheme or host is not allowed.
+        """
+        check_url(newurl, self.allow_private)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def http_get(url: str, allow_private: bool = True) -> bytes:
+    """GET a URL and return the body, refusing unsafe targets.
+
+    Every fetcher goes through here: the feed, HN, HF papers, and html_index
+    fetchers (fixed public https SOURCES, so allow_private stays True) and
+    fetch_one_url for --add-url (allow_private=False, since the URL is typed
+    by a person or an agent via the wiki-add skill).
+
+    Args:
+        url: http or https URL to fetch.
+        allow_private: False to also refuse hosts that resolve to loopback,
+            private, link-local, or reserved addresses (see check_url).
+
+    Returns:
+        The response body, at most MAX_FETCH_BYTES (longer bodies are cut
+        and a warning is logged).
+
+    Raises:
+        UnsafeURLError: the URL or a redirect target is refused.
+        urllib.error.URLError / HTTPError: the request itself failed.
+    """
+    check_url(url, allow_private)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
-        return resp.read()
+    # A dedicated opener rather than urlopen so redirects are checked too.
+    opener = urllib.request.build_opener(_CheckedRedirectHandler(allow_private))
+    with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+        body = resp.read(MAX_FETCH_BYTES + 1)
+    if len(body) > MAX_FETCH_BYTES:
+        log(f"  WARN {url}: response over {MAX_FETCH_BYTES} bytes, truncated")
+        body = body[:MAX_FETCH_BYTES]
+    return body
 
 
 def parse_date(raw: str | None) -> datetime | None:
@@ -1176,8 +1292,15 @@ def fetch_one_url(url: str, source: str | None) -> Item:
 
     Same extraction shape as the html_index corpus fetcher: strip markup, keep
     only long lines so nav and footer chrome is dropped.
+
+    The URL is user-supplied (often by an agent through the wiki-add skill),
+    so it is fetched with allow_private=False: whatever comes back is archived
+    and sent to the merge model, and could end up in the published wiki.
+
+    Raises:
+        UnsafeURLError: the URL is not http(s) or points at a non-public host.
     """
-    page = http_get(url).decode("utf-8", errors="replace")
+    page = http_get(url, allow_private=False).decode("utf-8", errors="replace")
     text = strip_html(page)
     prose = "\n\n".join(l.strip() for l in text.split("\n") if len(l.strip()) > 100)
     if len(prose) < 200:  # probably JS-rendered; keep whatever we got
@@ -1208,7 +1331,11 @@ def add_manual(url: str | None, note: str | None, title: str | None,
     """
     if url:
         log(f"fetching {url}")
-        item = fetch_one_url(url, source)
+        try:
+            item = fetch_one_url(url, source)
+        except UnsafeURLError as exc:  # a clear refusal, not a traceback
+            log(f"ERROR {exc.reason}")
+            return 1
     else:
         if not title:
             log("ERROR --add-note requires --title")

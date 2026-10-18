@@ -409,6 +409,133 @@ def test_commit_skips_data_that_lives_outside_the_wiki_repo():
         assert git(tmp, "show", "--name-only", "--format=", "HEAD").split() == ["INDEX.md"]
 
 
+# ── URL safety (http_get / --add-url) ───────────────────────────────────────
+# No test here touches the network: refused URLs fail before any request, literal
+# IPs resolve without DNS, and named hosts use a stubbed getaddrinfo.
+
+
+def refused(url: str, allow_private: bool = True) -> bool:
+    """True if check_url raises UnsafeURLError for this URL."""
+    try:
+        a.check_url(url, allow_private)
+        return False
+    except a.UnsafeURLError:
+        return True
+
+
+@contextlib.contextmanager
+def fake_dns(*addresses: str):
+    """Make socket.getaddrinfo return the given addresses for any host."""
+    real = a.socket.getaddrinfo
+
+    def stub(host, port, *args, **kwargs):
+        return [(a.socket.AF_INET6 if ":" in ip else a.socket.AF_INET, a.socket.SOCK_STREAM, 6, "", (ip, port))
+                for ip in addresses]
+    a.socket.getaddrinfo = stub
+    try:
+        yield
+    finally:
+        a.socket.getaddrinfo = real
+
+
+def test_only_http_and_https_urls_are_fetched():
+    """file://, ftp://, data: and scheme-less URLs are refused; http(s) to the built-in sources passes."""
+    for url in ("file:///Users/x/ai/ai-router/.env", "FILE:///etc/passwd", "ftp://example.com/x",
+                "data:text/plain,hi", "/etc/passwd", "https:///no-host"):
+        assert refused(url), url
+    assert not refused("https://www.anthropic.com/engineering")
+    assert not refused("http://example.com/feed")
+
+
+def test_add_url_refuses_loopback_private_and_link_local_ips():
+    """Literal non-public addresses are refused for user URLs but still allowed for built-in sources."""
+    for url in ("http://127.0.0.1:4000/v1/models", "http://10.0.0.5/", "http://192.168.1.1/",
+                "http://169.254.169.254/latest/meta-data/", "http://[::1]/", "http://[::ffff:127.0.0.1]/",
+                "http://0.0.0.0/", "http://100.64.0.1/"):
+        assert refused(url, allow_private=False), url
+        assert not refused(url, allow_private=True), url
+    assert not refused("https://8.8.8.8/", allow_private=False)        # public literal passes
+
+
+def test_add_url_refuses_a_name_with_any_private_address():
+    """Every resolved address is checked: one private answer among public ones is enough to refuse."""
+    with fake_dns("93.184.216.34", "10.0.0.5"):
+        assert refused("https://example.com/post", allow_private=False)
+    with fake_dns("127.0.0.1"):
+        assert refused("http://localhost:4000/", allow_private=False)
+    with fake_dns("93.184.216.34", "2606:2800:220:1::1"):
+        assert not refused("https://example.com/post", allow_private=False)
+
+
+def test_add_url_refuses_a_host_that_does_not_resolve():
+    """A resolution failure is a refusal, not an uncaught socket error."""
+    real = a.socket.getaddrinfo
+
+    def fail(*args, **kwargs):
+        raise a.socket.gaierror("nodename nor servname provided")
+    a.socket.getaddrinfo = fail
+    try:
+        assert refused("https://no-such-host.invalid/", allow_private=False)
+    finally:
+        a.socket.getaddrinfo = real
+
+
+def test_redirect_targets_are_checked():
+    """A redirect to file://, ftp://, or (for user URLs) a private host is refused before it is followed."""
+    req = a.urllib.request.Request("https://example.com/")
+    strict, lenient = a._CheckedRedirectHandler(False), a._CheckedRedirectHandler(True)
+    for handler, target in ((lenient, "file:///etc/passwd"), (lenient, "ftp://example.com/x"),
+                            (strict, "http://127.0.0.1:4000/v1"), (strict, "http://169.254.169.254/")):
+        try:
+            handler.redirect_request(req, None, 302, "Found", {}, target)
+            raise AssertionError(f"expected UnsafeURLError for {target}")
+        except a.UnsafeURLError:
+            pass
+    assert lenient.redirect_request(req, None, 302, "Found", {}, "https://example.com/b") is not None
+
+
+def test_http_get_refuses_before_any_request_and_caps_the_body():
+    """A refused URL never builds an opener; an oversized body is cut to MAX_FETCH_BYTES."""
+    opened: list[str] = []
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n=-1):
+            return b"x" * n
+
+    class Opener:
+        def open(self, req, timeout=None):
+            opened.append(req.full_url)
+            return Resp()
+
+    real_build, real_cap = a.urllib.request.build_opener, a.MAX_FETCH_BYTES
+    a.urllib.request.build_opener = lambda *handlers: Opener()
+    a.MAX_FETCH_BYTES = 10
+    try:
+        try:
+            a.http_get("file:///etc/passwd")
+            raise AssertionError("expected UnsafeURLError")
+        except a.UnsafeURLError:
+            pass
+        assert opened == []
+        assert a.http_get("https://example.com/feed") == b"x" * 10
+        assert opened == ["https://example.com/feed"]
+    finally:
+        a.urllib.request.build_opener, a.MAX_FETCH_BYTES = real_build, real_cap
+
+
+def test_add_url_refusal_is_a_clean_error_and_archives_nothing():
+    """--add-url file://... returns exit code 1 and writes no archive file."""
+    with sandbox():
+        assert a.add_manual("file:///Users/x/ai/ai-router/.env", None, None, None, {}) == 1
+        assert not a.ARCHIVE_DIR.exists() or not any(a.ARCHIVE_DIR.iterdir())
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
