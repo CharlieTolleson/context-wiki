@@ -5,6 +5,9 @@ Covers the parts of the pipeline that protect the wiki from bad merges and bad
 archive writes: the shrink guard and its retry, archive de-duplication and
 re-offering of unmerged items, the scoping of the automatic git commit, the
 topic-file split, and the per-card date binding of the html_index scraper.
+Also covers the coverage radar (emerging-term detection, the watchlist and its
+merge guard), chunked merging, deletion-based pruning, thin-item enrichment,
+and the source table's invariants.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -30,8 +33,10 @@ os.environ["WIKI_GIT_COMMIT"] = "auto"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ingest"))
 import ai_research as a  # noqa: E402
+import radar  # noqa: E402
 
-PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT")
+PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT",
+              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH")
 
 
 @contextlib.contextmanager
@@ -47,6 +52,9 @@ def sandbox():
     if "TOPICS_DIR" in saved:
         a.TOPICS_DIR = tmp / "topics"
     a.GIT_COMMIT = "auto"
+    a.DROPPED_PATH = tmp / "ingest" / "dropped_claims.jsonl"
+    a.RECALL_PATH = tmp / "ingest" / "RECALL.md"
+    a.WATCHLIST_PATH = tmp / "watchlist.txt"      # absent unless a test writes one
     (tmp / "ingest").mkdir()
     try:
         yield tmp
@@ -534,6 +542,206 @@ def test_add_url_refusal_is_a_clean_error_and_archives_nothing():
     with sandbox():
         assert a.add_manual("file:///Users/x/ai/ai-router/.env", None, None, None, {}) == 1
         assert not a.ARCHIVE_DIR.exists() or not any(a.ARCHIVE_DIR.iterdir())
+
+
+# ── coverage radar ──────────────────────────────────────────────────────────
+
+
+def arch_item(item_id: str, source: str, title: str, body: str) -> a.Item:
+    """An archived item whose id carries the archive date, as radar expects."""
+    return a.Item(source, item_id.split("-")[3], title, "", datetime.now(timezone.utc), body, item_id)
+
+
+def test_a_coinage_in_two_items_on_two_days_is_an_emerging_term():
+    """A non-dictionary token seen in 2 items on 2 days, absent from the baseline and the wiki, is reported."""
+    window = [arch_item("2026-10-02-ls-01", "latent-space", "Pi 1.0", "ships with Codemode support"),
+              arch_item("2026-10-03-nw-01", "news", "Roundup", "the model really loves codemode"),
+              arch_item("2026-10-03-nw-02", "news", "Other", "nothing relevant here")]
+    baseline = [arch_item("2026-08-01-ab-01", "x", "Old post", "plain old text about databases")]
+    found = radar.emerging_terms(window, baseline, "## Wiki\n\n- something else\n")
+    assert "codemode" in [c.key for c in found]
+    covered_wiki = "## Wiki\n\n- Use Code Mode to let agents write code. [2026-01-01-ab-01]\n"
+    assert "codemode" not in [c.key for c in radar.emerging_terms(window, baseline, covered_wiki)]
+
+
+def test_an_ordinary_phrase_needs_two_independent_sources():
+    """A common-word phrase from a single source is not a trend, even if it repeats."""
+    one_source = [arch_item(f"2026-10-0{d}-ab-01", "only-one", "t", "the early access program") for d in (1, 2, 3)]
+    has = lambda items: [c for c in radar.emerging_terms(items, [], "") if "early access" in c.term]
+    assert not has(one_source)
+    two = one_source[:2] + [arch_item("2026-10-04-cd-01", "other", "t", "an early access program")]
+    assert has(two)
+
+
+def test_a_term_common_in_the_older_archive_is_not_new():
+    """The baseline test rejects vocabulary the archive already uses a lot."""
+    window = [arch_item("2026-10-02-ls-01", "a", "t", "shipping codemode"),
+              arch_item("2026-10-03-nw-01", "b", "t", "also codemode")]
+    baseline = [arch_item(f"2026-08-0{n}-ab-01", "x", "t", "codemode everywhere") for n in range(1, 6)]
+    assert not radar.emerging_terms(window, baseline, "")
+
+
+def test_watchlist_matches_any_spelling_and_detects_regressions():
+    """'code mode', 'code-mode' and 'codemode' are one concept; losing the last mention is a regression."""
+    entries = radar.parse_watchlist("# comment\ncode mode | codemode  # trailing\n\nprompt caching\n")
+    assert entries == [["code mode", "codemode"], ["prompt caching"]]
+    old = "- Use Code-Mode for MCP.\n- Enable prompt caching.\n"
+    assert radar.missing_watch(old, entries) == []
+    new = "- Enable prompt caching.\n"
+    assert radar.lost_watch(old, new, entries) == [["code mode", "codemode"]]
+    assert radar.missing_watch(new, entries) == [["code mode", "codemode"]]
+
+
+def test_merge_checked_rejects_a_result_that_loses_a_watchlist_concept():
+    """A merge that deletes every mention of a covered watchlist concept is retried, then rejected."""
+    with sandbox() as tmp:
+        a.WATCHLIST_PATH.write_text("code mode\n")
+        old = doc(10) + "\n- Use code mode for MCP tools. - blog, 2026-01-01 [2026-01-01-zz-01]\n"
+        lacking, keeping = doc(10), old
+        calls: list[str] = []
+        real = a.merge_index
+
+        def stub(*answers):
+            it = iter(answers)
+
+            def f(index_md, items, creds, correction=""):
+                calls.append(correction)
+                return next(it)
+            return f
+        try:
+            a.merge_index = stub(lacking, keeping)
+            assert a.merge_checked(old, [], {}) == keeping
+            assert "code mode" in calls[1] and "must keep" in calls[1]
+            a.merge_index = stub(lacking, lacking)
+            try:
+                a.merge_checked(old, [], {})
+                raise AssertionError("expected MergeRejected")
+            except a.MergeRejected as exc:
+                assert "code mode" in str(exc)
+        finally:
+            a.merge_index = real
+
+
+def test_accepted_merges_log_the_claims_they_removed():
+    """Removed claims are appended to the ledger, and recent_drops reads them back."""
+    with sandbox():
+        old, new = doc(10), doc(10, tag="cd")
+        assert a.record_dropped(old, new) == 10
+        assert len(a.recent_drops(days=1, limit=50)) == 10
+        assert a.record_dropped(old, old) == 0
+
+
+# ── chunked merge and pruning ───────────────────────────────────────────────
+
+
+def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
+    """Items go to the model MERGE_CHUNK at a time; a rejected chunk is skipped, the rest still land."""
+    items = [item("ab", f"https://x/{n}") for n in range(a.MERGE_CHUNK * 2 + 3)]
+    seen: list[int] = []
+    real = a.merge_checked
+
+    def fake(index_md, chunk, creds, hint="", retries=1):
+        seen.append(len(chunk))
+        if len(seen) == 2:
+            raise a.MergeRejected("nope")
+        return index_md + f"\n- claim {len(seen)}"
+    try:
+        a.merge_checked = fake
+        out, merged = a.merge_chunked("## S\n", items, {})
+        assert seen == [a.MERGE_CHUNK, a.MERGE_CHUNK, 3]
+        assert len(merged) == a.MERGE_CHUNK + 3 and "claim 3" in out and "claim 2" not in out
+        a.merge_checked = lambda *args, **kw: (_ for _ in ()).throw(a.MergeRejected("all bad"))
+        try:
+            a.merge_chunked("## S\n", items, {})
+            raise AssertionError("expected MergeRejected")
+        except a.MergeRejected:
+            pass
+    finally:
+        a.merge_checked = real
+
+
+def test_prune_deletes_selected_claims_and_spares_sole_watchlist_coverage():
+    """Pruning removes the model's picks byte-for-byte, except the only claim on a watchlist concept."""
+    import openai
+    with sandbox():
+        a.WATCHLIST_PATH.write_text("code mode\n")
+        filler = " ".join(["word"] * 60)
+        lines = [f"- {filler} number {n} [2026-01-01-ab-{n:02d}]" for n in range(40)]
+        lines[7] = f"- Use code mode for MCP. {filler} [2026-01-01-zz-07]"
+        wiki = "## S\n\n" + "\n".join(lines) + "\n"
+        assert len(wiki.split()) > a.WORD_CAP
+
+        class FakeClient:
+            def __init__(self, **kw):
+                self.chat = type("C", (), {"completions": self})()
+
+            def create(self, **kw):
+                msg = type("M", (), {"content": str(list(range(0, 20)))})()
+                return type("R", (), {"choices": [type("Ch", (), {"message": msg})()]})()
+        real = openai.OpenAI
+        openai.OpenAI = FakeClient
+        try:
+            out = a.prune_to_cap(wiki, {"base_url": "x", "api_key": "y"})
+        finally:
+            openai.OpenAI = real
+        assert "code mode" in out                       # claim 7 was picked but is the sole carrier
+        kept = [l for l in out.splitlines() if l.startswith("- ")]
+        assert all(l in lines for l in kept)            # survivors are untouched
+        assert len(kept) == 40 - 19                     # 20 picked, 1 spared
+
+
+# ── sources, feeds, enrichment ──────────────────────────────────────────────
+
+
+def test_source_table_invariants():
+    """Slugs are unique two-letter lowercase codes (they become part of item ids) and kinds are known."""
+    slugs = [s[1] for s in a.SOURCES]
+    assert len(slugs) == len(set(slugs))
+    assert all(a.ID_RE.fullmatch(f"2026-01-01-{s}-01") for s in slugs), slugs
+    assert all(s[2] in a.FETCHERS for s in a.SOURCES)
+    assert set(a.SOURCE_KEYWORDS) <= {s[0] for s in a.SOURCES}
+
+
+def test_parse_xml_repairs_a_bare_ampersand():
+    """A feed with an unescaped & parses after one repair attempt instead of failing the source."""
+    raw = b"<rss><channel><item><title>Q&A about agents</title></item></channel></rss>"
+    assert a.parse_xml(raw).find(".//title").text == "Q&A about agents"
+
+
+def test_enrich_replaces_thin_bodies_and_ignores_failures():
+    """Thin items get the page text; fetch failures and HN discussion links leave the item as it was."""
+    page = ("<html><body><nav>menu</nav><p>" + "This article explains the technique in useful detail. " * 5
+            + "</p></body></html>").encode()
+    real = a.http_get
+
+    seen_private: list[bool] = []
+
+    def fake(url, allow_private=True):
+        seen_private.append(allow_private)
+        if "boom" in url:
+            raise OSError("down")
+        return page
+    thin = lambda u: a.Item("s", "ab", "t", u, datetime.now(timezone.utc), "short body")
+    items = [thin("https://ok.example/a"), thin("https://boom.example/b"),
+             thin("https://news.ycombinator.com/item?id=1")]
+    fat = a.Item("s", "ab", "t", "https://ok.example/c", datetime.now(timezone.utc), "x" * 800)
+    try:
+        a.http_get = fake
+        assert a.enrich_thin(items + [fat]) == 1
+    finally:
+        a.http_get = real
+    assert seen_private and not any(seen_private)   # article links come from untrusted feeds: SSRF guard on
+    assert "useful detail" in items[0].body and items[0].body.endswith("short body")
+    assert items[1].body == "short body" and items[2].body == "short body" and fat.body == "x" * 800
+
+
+def test_radar_queries_put_watchlist_first_dedupe_and_stay_capped():
+    """Search terms: missing watchlist concepts (capped), then emerging terms, no duplicates, max RADAR_SEARCH_TERMS."""
+    with sandbox():
+        a.WATCHLIST_PATH.write_text("\n".join(f"concept number {n}" for n in range(9)) + "\n")
+        report = a.radar_scan("## nothing\n", None)
+        assert len(report.missing) == 9
+        assert report.queries == [f"concept number {n}" for n in range(a.RADAR_WATCHLIST_SLOTS)]
 
 
 if __name__ == "__main__":

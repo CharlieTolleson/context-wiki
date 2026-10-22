@@ -1,0 +1,19 @@
+# Concepts the wiki must cover. One per line, aliases separated by "|", "#" starts a comment.
+# The first alias is the canonical name. Two effects:
+#   1. A concept with no mention in the wiki is searched for on Hacker News (any date) every
+#      run and flagged to the merge, until a claim covers it.
+#   2. Once covered, a merge that removes every mention is rejected and retried, so a covered
+#      concept cannot be pruned away silently.
+# Add a line whenever you hear of a new technique you want your agents to know about.
+
+code mode | codemode | code execution with mcp | programmatic tool calling
+context engineering
+prompt caching
+model context protocol | mcp
+tool search | tool-search
+subagents | sub-agents
+context compaction | compaction
+agent memory
+agent sandbox | agent sandboxes
+agent evals | eval harness
+agent skills

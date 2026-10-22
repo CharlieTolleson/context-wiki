@@ -11,13 +11,16 @@ The idea: do the expensive work **once, at write time**, and make reading cheap.
 ## How it works
 
 ```
-sources (RSS/Atom, Hacker News, HF papers, Anthropic engineering blog)
+sources: ~20 RSS/Atom feeds (practitioners + vendor engineering blogs), Hacker News,
+         HF papers, Anthropic engineering blog
    |   date watermark per source: only items newer than the last successful pull
+   |   + coverage radar: targeted searches for concepts the wiki is missing (see below)
+   |   + thin items get the linked page's text fetched
    v
 archive/YYYY-MM-DD.md     every item in full, with a stable id like 2026-10-07-sw-03   (append-only)
    |
-   v   ONE LLM call: current wiki + new items in, complete updated wiki out
-   |   guards: shrink guard (+1 retry), word cap, lint report
+   v   LLM merges, 15 items per call, each call against the previous result
+   |   guards: shrink guard, watchlist guard (+ retries), then prune to the word cap
    v
 INDEX.md  +  topics/<topic>.md        what agents read
 ```
@@ -29,6 +32,9 @@ Design decisions worth knowing:
 - **Content-based pruning.** Nothing expires on a timer. A claim leaves only when it is superseded, absorbed into another claim, or no longer decision-relevant.
 - **Greppable ids.** Every claim ends with an attribution (source, date, and item ids in brackets). `grep -rn "<item-id>" archive/` returns the stored article and its URL, so follow-up questions need no network call.
 - **Shrink guard.** A merge that keeps under 75% of the existing claims is retried once with the dropped claims listed, then rejected, leaving the wiki untouched. A model can ignore "the word cap is a ceiling, not a target"; code cannot.
+- **Watchlist guard.** `watchlist.txt` lists concepts that must be covered (one per line, aliases separated by `|`). Once the wiki mentions a concept, a merge that removes every mention is retried and then rejected, so a technique cannot be pruned away by accident.
+- **Chunked merging.** Items go to the model 15 at a time, each chunk merging into the result of the last. One 60-item prompt made the model either rewrite the wiki wholesale (tripping the guards) or ignore the new items.
+- **Pruning by deletion.** The word cap is enforced in code. When the wiki is over it, the model is shown the numbered claims and returns only the numbers to delete; the code deletes them, so every surviving claim is byte-for-byte unchanged, and never deletes the sole claim covering a watchlist concept. (Asking the model to retype a shorter wiki cut whole topics at random.)
 - **Topic files.** A section over 500 words moves to `topics/<slug>.md` and `INDEX.md` keeps a one-line pointer (claim count, last updated, scope). Small sections stay inline. This is purely storage: the merge always sees one assembled document.
 - **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, and claims that lead with a research-artifact name instead of a practice. Reported, never auto-fixed.
 - **Untrusted input.** Feed titles and bodies are wrapped in an explicit "data, not instructions" block before they reach the model.
@@ -72,9 +78,21 @@ The first run looks back 14 days (`LOOKBACK_CAP_DAYS`) and writes `INDEX.md`, `a
 | `--backfill --since YYYY-MM-DD` | Same, limited to archive items from that run date onward |
 | `--add-url URL [--source NAME]` | Fetch one page by hand and run it through the same archive and merge path. Only public `http`/`https` URLs are accepted: `file://` and hosts that resolve to loopback, private, or link-local addresses are refused |
 | `--add-note TEXT --title TITLE [--source NAME]` | Store a finding that has no URL (something you learned yourself) |
+| `--radar` | Print the coverage report (watchlist gaps, emerging terms, recent removals) and write `RECALL.md` |
+| `--prune` | Bring an over-cap wiki back under the word cap by model-selected deletion |
 | `--rebuild-index` | Re-store the wiki through the topic-file layout. No fetching, no LLM call |
 
 Manual adds follow exactly the same rules as the scheduled job: the same inclusion test, merge rules, word cap, and attribution format. Do not edit `INDEX.md` or `topics/` by hand; the next merge will overwrite your edit.
+
+## Keeping recall high: the coverage radar
+
+A merge that sees each batch alone cannot notice that an idea is spreading, or that its originating blog is not a source. The radar covers that, using three cheap signals. It is advisory, so a failure in it never stops a run.
+
+- **Watchlist.** A concept in `watchlist.txt` that the wiki does not mention is searched for on Hacker News at any date every run (relevance-ranked, so the originating post is found even months later), and the merge is told it is a known gap.
+- **Emerging terms.** Phrases and coined words that recur in the last 21 days of archive, were rare before, and are not in the wiki. A small model (`WIKI_RADAR_MODEL`) keeps the ones that name techniques, tools, or protocols; those are searched for too.
+- **Recall report.** Every claim a merge removes is appended to `dropped_claims.jsonl`, and each run writes `RECALL.md` (watchlist gaps, emerging terms, recent removals) and one `RECALL ...` line to the log. `ai_research.py --radar` prints it on demand.
+
+The example that motivated it: Cloudflare's "Code Mode" (agents write code against MCP tools instead of calling them one by one) was ingested once, pruned a day later, never re-found because the originating blog was not a source, and mentioned only in passing afterwards.
 
 ## Configuration
 
@@ -85,7 +103,9 @@ Each setting can be an environment variable or a `KEY=VALUE` line in `.env` at t
 | `WIKI_DATA_DIR` | repo root | Where the readable wiki is written: `INDEX.md` and `topics/` |
 | `WIKI_ARCHIVE_DIR` | `archive/` in the repo | The raw archive of fetched articles |
 | `WIKI_STATE_DIR` | `ingest/` in the repo | Watermarks (`state.json`) and the backfill ledger |
-| `WIKI_MODEL` | `claude-sonnet-5` | Model alias used for the merge |
+| `WIKI_MODEL` | `claude-sonnet-5` | Model alias used for the merge and the prune |
+| `WIKI_RADAR_MODEL` | `cheap` | Small model alias that filters emerging-term candidates (never writes the wiki) |
+| `WIKI_WATCHLIST` | `watchlist.txt` in the repo | Concepts that must be covered |
 | `LITELLM_BASE_URL`, `LITELLM_MASTER_KEY` | none | Endpoint and key |
 | `WIKI_ENV_FILE` | the repo `.env` | Optional separate file to read the two endpoint values from, so secrets can stay in one shared place |
 | `WIKI_GIT_COMMIT` | `auto` | `auto` commits the wiki after a run when its folder is a git repo and the data is not ignored; `0` never commits |
@@ -95,12 +115,15 @@ Constants at the top of `ingest/ai_research.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `SOURCES` | 11 sources | Add a tuple `(name, two-letter-id, kind, url)`. Kinds: `feed` (RSS or Atom), `hn`, `hf_papers`, `html_index`. The id must be exactly two lowercase letters |
+| `SOURCES` | 23 sources | Add a tuple `(name, two-letter-id, kind, url)`. Kinds: `feed` (RSS or Atom), `hn`, `hf_papers`, `html_index`. The id must be exactly two lowercase letters |
+| `SOURCE_KEYWORDS` | 9 sources | General engineering blogs whose items are kept only when the title or opening matches `RELEVANCE_RE` |
 | `SOURCE_QUOTA` | papers 3, HN 10 | Max items a high-volume source may put in one merge batch |
 | `WORD_CAP` | `2000` | Hard cap on the whole wiki. The merge prompt, lint, and shrink guard all follow it |
 | `LOOKBACK_CAP_DAYS` | `14` | Longest backfill after an outage |
 | `TOPIC_META` | 7 sections | Section titles, file slugs, and one-line scopes. Sections the model invents are handled too |
-| `HN_QUERIES`, `HN_MIN_POINTS` | 8 topics, 75 | Hacker News is queried by topic, not by front page |
+| `MERGE_CHUNK` | `15` | Items per merge call |
+| `ENRICH_LIMIT`, `ENRICH_MIN_BODY` | 40, 500 | Thin items (body under 500 characters) get the linked page fetched, up to 40 per run |
+| `HN_QUERIES`, `HN_MIN_POINTS` | 16 topics, 75 | Hacker News is queried by topic, not by front page |
 
 The merge prompt is the `MERGE_SYSTEM` string. Tune it for your own definition of "worth keeping".
 
@@ -175,12 +198,13 @@ To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (o
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip and the missing-file safety check), and the date binding of the `html_index` scraper (each article takes the date from its own card). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
+They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip and the missing-file safety check), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 
-- **Thin feed bodies cannot qualify.** Feeds that only publish a teaser (and link-only Hacker News stories) give the merge nothing to extract a practice from, so they are almost never cited. Fetching full text for those items is not implemented yet.
+- **Page enrichment is best effort.** Thin items get the linked page's text, but paywalled, JavaScript-rendered, or blocking sites leave the original teaser, and at most 40 items are fetched per run.
 - **The HF Daily Papers fetcher filters on each paper's `publishedAt`**, which can be up to two weeks older than the day it was listed, so it currently drops most of the list.
-- **Some sites block scripted fetches.** `openai.com` returns 403 to plain HTTP clients, so those posts rely on the feed teaser.
+- **Some sites block scripted fetches.** `openai.com/blog` returns 403 to plain HTTP clients, and its working news feed is mostly customer stories, so OpenAI is not a source. The Anthropic news page has no feed either.
+- **The emerging-term detector is statistical and modest.** It needs a term to appear in two or three archive items on different days, so a concept mentioned once is invisible to it; the watchlist and the vendor-blog sources are the main defence, and the detector is the net under them.
 - **Merge quality depends on the model.** Lint reports the failures a model keeps making (duplicate ids, artifact-name bullets); it does not fix them.
 - **No license file yet.** Until one is added, the default is all rights reserved.

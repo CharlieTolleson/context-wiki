@@ -5,6 +5,8 @@ topics/
 archive/
 ingest/state.json
 ingest/backfill_reviewed.json
+ingest/dropped_claims.jsonl
+ingest/RECALL.md
 
 # Local configuration and environments
 .env
