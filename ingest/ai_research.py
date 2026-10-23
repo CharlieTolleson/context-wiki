@@ -226,9 +226,10 @@ RELEVANCE_RE = re.compile(
 SOURCE_KEYWORDS = {"vercel", "replit", "aws-ml", "together-ai", "ms-foundry", "google-dev",
                    "github-blog", "weaviate", "cloudflare-blog"}
 
-# Max items a source may contribute to any single merge batch. Papers out-volume
-# every practitioner blog ~25:1; without a cap they crowd out everything that is
-# actually actionable. Everything still lands in the archive regardless.
+# Max items a source may contribute to any single merge batch, however small the
+# batch (see select_for_merge). Papers out-volume every practitioner blog ~25:1;
+# without a cap they crowd out everything that is actually actionable. Everything
+# still lands in the archive regardless.
 # hf-daily-papers is deliberately throttled to a trickle. It is 95% of the
 # volume and ~100% of the residual noise: abstracts describe methods you
 # cannot install, so they resist being turned into build guidance. Kept only
@@ -551,7 +552,15 @@ def fetch_hn(name: str, slug: str, url: str, since: datetime) -> list[Item]:
 
 
 def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Item]:
-    """HF Daily Papers. Per-day endpoint, so loop the days we missed."""
+    """HF Daily Papers. Per-day endpoint, so loop the days we missed.
+
+    Novelty is the listing day, not each paper's `publishedAt`. A day's list carries
+    papers published up to about two weeks earlier, so filtering on `publishedAt`
+    against the watermark dropped nearly every paper (0 per run for a week straight
+    in October 2026). The day loop already starts at the watermark day, and
+    write_archive drops any URL that is already archived, so re-reading the watermark
+    day costs nothing. `publishedAt` is kept on the item for attribution.
+    """
     items: list[Item] = []
     today = datetime.now(timezone.utc).date()
     day = max(since.date(), today - timedelta(days=LOOKBACK_CAP_DAYS))
@@ -565,8 +574,6 @@ def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Ite
             paper = entry.get("paper", {}) or {}
             pid = paper.get("id", "")
             pub = parse_date(entry.get("publishedAt")) or datetime.now(timezone.utc)
-            if pub <= since:
-                continue
             items.append(Item(
                 name, slug,
                 entry.get("title") or paper.get("title", ""),
@@ -1358,10 +1365,12 @@ def select_for_merge(items: list[Item]) -> list[Item]:
     A pure newest-N slice is dominated by whichever source publishes most (HF
     Daily Papers runs ~15/day against a blog's ~1/week), which silently starves
     the higher-signal low-volume sources.
-    """
-    if len(items) <= MAX_MERGE_ITEMS:
-        return sorted(items, key=lambda i: i.published, reverse=True)[:MAX_MERGE_ITEMS]
 
+    SOURCE_QUOTA applies to every batch, including one that fits under
+    MAX_MERGE_ITEMS. A normal day's fetch is 10 to 30 items plus 20 to 50 papers,
+    so a quota that only kicked in above the batch cap let papers flood exactly
+    the batches the daily run produces. Items a quota drops stay archived.
+    """
     buckets: dict[str, list[Item]] = {}
     for it in sorted(items, key=lambda i: i.published, reverse=True):
         buckets.setdefault(it.source, []).append(it)
@@ -1370,6 +1379,10 @@ def select_for_merge(items: list[Item]) -> list[Item]:
     for src, cap in SOURCE_QUOTA.items():
         if src in buckets:
             buckets[src] = buckets[src][:cap]
+
+    if sum(len(b) for b in buckets.values()) <= MAX_MERGE_ITEMS:
+        return sorted((it for b in buckets.values() for it in b),
+                      key=lambda i: i.published, reverse=True)
 
     picked: list[Item] = []
     while len(picked) < MAX_MERGE_ITEMS and any(buckets.values()):

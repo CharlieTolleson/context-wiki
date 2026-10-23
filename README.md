@@ -115,9 +115,9 @@ Constants at the top of `ingest/ai_research.py`:
 
 | Constant | Default | Meaning |
 |---|---|---|
-| `SOURCES` | 23 sources | Add a tuple `(name, two-letter-id, kind, url)`. Kinds: `feed` (RSS or Atom), `hn`, `hf_papers`, `html_index`. The id must be exactly two lowercase letters |
+| `SOURCES` | 23 sources | Add a tuple `(name, two-letter-id, kind, url)`. Kinds: `feed` (RSS or Atom), `hn`, `hf_papers` (new by listing day, since a day's list carries papers published weeks earlier), `html_index`. The id must be exactly two lowercase letters |
 | `SOURCE_KEYWORDS` | 9 sources | General engineering blogs whose items are kept only when the title or opening matches `RELEVANCE_RE` |
-| `SOURCE_QUOTA` | papers 3, HN 10 | Max items a high-volume source may put in one merge batch |
+| `SOURCE_QUOTA` | papers 3, HN 10 | Max items a high-volume source may put in one merge batch, however small the batch. The rest stay archived |
 | `WORD_CAP` | `2000` | Hard cap on the whole wiki. The merge prompt, lint, and shrink guard all follow it |
 | `LOOKBACK_CAP_DAYS` | `14` | Longest backfill after an outage |
 | `TOPIC_META` | 7 sections | Section titles, file slugs, and one-line scopes. Sections the model invents are handled too |
@@ -198,12 +198,11 @@ To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (o
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, the lint's checks against the archive (fabricated ids, changed dates, bodiless sources, artifact names), commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
+They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, per-source quotas on small batches, the papers fetcher, the lint's checks against the archive (fabricated ids, changed dates, bodiless sources, artifact names), commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 
 - **Page enrichment is best effort.** Thin items get the linked page's text, but paywalled, JavaScript-rendered, or blocking sites leave the original teaser, and at most 40 items are fetched per run.
-- **The HF Daily Papers fetcher filters on each paper's `publishedAt`**, which can be up to two weeks older than the day it was listed, so it currently drops most of the list.
 - **Some sites block scripted fetches.** `openai.com/blog` returns 403 to plain HTTP clients, and its working news feed is mostly customer stories, so OpenAI is not a source. The Anthropic news page has no feed either.
 - **The emerging-term detector is statistical and modest.** It needs a term to appear in two or three archive items on different days, so a concept mentioned once is invisible to it; the watchlist and the vendor-blog sources are the main defence, and the detector is the net under them.
 - **Merge quality depends on the model.** Lint reports the failures a model keeps making (duplicate ids, artifact-name bullets, a citation date the model changed); it does not fix them. The artifact-name check keeps a small allowlist (`ARTIFACT_ALLOWLIST`) for products and generic terms that legitimately head a practice.
