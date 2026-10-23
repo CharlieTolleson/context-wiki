@@ -1723,7 +1723,7 @@ def backfill(creds: dict[str, str], since: datetime | None = None) -> int:
         reviewed.update(i.item_id for i in batch)
         REVIEWED_PATH.write_text(json.dumps(sorted(reviewed)) + "\n")
         log(f"  -> {len(updated.split())} words")
-        lint_index(updated, {i.item_id for i in batch})
+        lint_index(updated, {i.item_id for i in batch}, archive_facts())
         if n >= MAX_BACKFILL_PASSES:
             if remaining:
                 left = {}
@@ -1740,15 +1740,57 @@ def backfill(creds: dict[str, str], since: datetime | None = None) -> int:
 
 ID_RE = re.compile(r"\d{4}-\d{2}-\d{2}-[a-z]{2}-\d+")
 
+# The body write_archive stores for an item that arrived with no text. read_archive hands
+# it back verbatim, so the lint can tell a real body from this placeholder.
+NO_BODY_PLACEHOLDER = "(no body in feed"
 
-def lint_index(md: str, known_ids: set[str]) -> None:
+# Names the artifact-name lint must not report. Each is a product or a generic term that
+# legitimately heads a practice ("Use Claude Code auto mode to..."), not a research
+# artifact nobody can install. Keep it short; a long allowlist hides real failures.
+ARTIFACT_ALLOWLIST = {
+    "Claude Code",
+    "Claude Managed Agents",
+    "Contextual Retrieval",   # a named technique, so "Implement Contextual Retrieval" is a practice
+    # "Bayesian" was listed here as an adjective, but the one live hit ("Utilize Bayesian
+    # reliability memory (BaRe-Mem) ...") is an hf-daily-papers artifact, so it stays reportable.
+}
+
+
+def archive_facts() -> dict[str, tuple[str, bool]]:
+    """Ground truth about every archived item, for lint_index.
+
+    Returns:
+        {item_id: (published date as YYYY-MM-DD, whether the record has a real body)}.
+        A record whose body is the "(no body in feed ...)" placeholder counts as bodiless.
+    """
+    return {
+        it.item_id: (it.published.date().isoformat(),
+                     bool(it.body) and not it.body.startswith(NO_BODY_PLACEHOLDER))
+        for it in read_archive()
+    }
+
+
+def lint_index(md: str, known_ids: set[str],
+               facts: dict[str, tuple[str, bool]] | None = None) -> None:
     """Deterministic checks on the merged wiki.
 
     The merge rules the model is asked to follow (dedupe, supersession, word
     cap) are editorial judgements it can and does silently skip. These checks
     make the failures visible in the run log instead of letting them accrete.
     Reported, not auto-fixed, git history is the audit trail.
+
+    Args:
+        md: The wiki text the merge returned (what write_wiki stored).
+        known_ids: Ids of the items in this merge batch.
+        facts: archive_facts() output: the archive's record of every id. The archive is
+            the ground truth for citations, so it, not the stored wiki, decides whether an
+            id is real. Callers lint after write_wiki, so reading the wiki back here would
+            only ever confirm the ids the model just wrote (the fabricated-id check could
+            never fire). None reads the archive now. An empty dict (no archive on disk)
+            skips the id, date, and body checks and logs that it did.
     """
+    if facts is None:
+        facts = archive_facts()
     problems: list[str] = []
 
     words = len(md.split())
@@ -1764,11 +1806,39 @@ def lint_index(md: str, known_ids: set[str]) -> None:
     if dupes:
         problems.append(f"item id(s) cited in >1 bullet (merge rule missed): {', '.join(dupes)}")
 
-    # Ids the model invented, ignoring anything carried over from a prior run.
-    prior = set(ID_RE.findall(read_wiki()))
-    unknown = sorted(set(seen) - known_ids - prior)
-    if unknown:
-        problems.append(f"unknown item id(s), possibly fabricated: {', '.join(unknown[:5])}")
+    # The three archive-backed checks need an archive to compare against. A fresh clone
+    # (archive/ is gitignored) or a wrong WIKI_ARCHIVE_DIR has none, and running them
+    # anyway would report every cited id outside the batch as fabricated. Say so instead.
+    if not facts:
+        problems.append("archive empty; id/date/body checks skipped")
+    else:
+        # Ids that are neither in this batch nor anywhere in the archive: the model invented
+        # them (or a hand edit broke one). Every cited id must resolve by grep in the archive.
+        unknown = sorted(set(seen) - known_ids - set(facts))
+        if unknown:
+            problems.append(f"unknown item id(s), possibly fabricated: {', '.join(unknown)}")
+
+        # A claim citing one item must carry that item's published date. A rewrite on
+        # 2026-10-15 silently turned a 2025-01-06 citation into 2026-01-06; a merge that
+        # changes a date it was told to copy is the same failure as inventing an id.
+        # Multi-id claims are skipped: their date is that of the newest source by design.
+        misdated: list[str] = []
+        for b in bullets:
+            cited = set(ID_RE.findall(b))
+            if len(cited) != 1:
+                continue
+            cid = next(iter(cited))
+            m = CLAIM_DATE_RE.search(b)
+            if cid in facts and m and m.group(1) != facts[cid][0]:
+                misdated.append(f"{cid} cited {m.group(1)}, archived {facts[cid][0]}")
+        if misdated:
+            problems.append(f"claim date differs from the archive: {'; '.join(misdated)}")
+
+        # A record with no body gave the merge only a title to work from, so a claim built on
+        # it is a guess. Worth fetching the full text (--add-url) and re-merging.
+        bodiless = sorted(cid for cid in seen if cid in facts and not facts[cid][1])
+        if bodiless:
+            problems.append(f"claim(s) cite an item whose archive record has no body: {', '.join(bodiless)}")
 
     if not [ln for ln in md.splitlines() if ln.startswith("## ")]:
         problems.append("no H2 topic sections found")
@@ -1780,11 +1850,20 @@ def lint_index(md: str, known_ids: set[str]) -> None:
         r"^-\s+(?:Use|Implement|Adopt|Utilize|Leverage|Introduce|Employ|Apply)\s+"
         r"(?:the\s+|a\s+)?([A-Z][A-Za-z0-9]*(?:[- ][A-Z][A-Za-z0-9]*)*)\b"
     )
-    named = [m.group(1) for ln in bullets if (m := artifact.match(ln.strip()))]
+    named: list[str] = []
+    for ln in bullets:
+        m = artifact.match(ln.strip())
+        if not m or m.group(1) in ARTIFACT_ALLOWLIST:
+            continue
+        # "React-style hooks" and "OpenAI's agents" name a style or an owner, not an
+        # artifact the claim tells the reader to install.
+        if ln.strip()[m.end():].startswith(("-style", "'s", "’s")):
+            continue
+        named.append(m.group(1))
     if named:
         problems.append(
             f"{len(named)} bullet(s) lead with a named artifact rather than a practice: "
-            + ", ".join(named[:6])
+            + ", ".join(named)
         )
 
     for p in problems:
@@ -1927,7 +2006,7 @@ def add_manual(url: str | None, note: str | None, title: str | None,
     before = index_md
     write_wiki(updated)
     log(f"INDEX.md rewritten: {len(updated.split())} words (cap {WORD_CAP})")
-    lint_index(updated, {item.item_id})
+    lint_index(updated, {item.item_id}, archive_facts())
     if item.item_id and item.item_id not in updated:
         log("NOTE the merge did not cite this item, it did not clear the "
             "inclusion bar. Archived and greppable regardless.")
@@ -2087,7 +2166,9 @@ def main() -> int:
         items.sort(key=lambda i: i.published)
         all_items.extend(items)
         new_state[name] = run_started.isoformat()
-        log(f"  {name}: {len(items)} new since {since.date()}")
+        # The watermark is a timestamp, so print the time: printing only the date made a
+        # watermark that advanced by a day look stuck across consecutive runs.
+        log(f"  {name}: {len(items)} new since {since.isoformat(timespec='minutes')}")
 
     # Coverage radar: find concepts the wiki lacks and search for their originating posts.
     # Advisory only; a failure here must never stop the run.
@@ -2158,7 +2239,7 @@ def main() -> int:
     updated = prune_to_cap(updated, creds)
     write_wiki(updated)
     log(f"INDEX.md rewritten: {len(updated.split())} words (cap {WORD_CAP})")
-    lint_index(updated, {i.item_id for i in merged_items})
+    lint_index(updated, {i.item_id for i in merged_items}, archive_facts())
 
     mark_reviewed(i.item_id for i in merged_items)
     STATE_PATH.write_text(json.dumps(new_state, indent=2) + "\n")

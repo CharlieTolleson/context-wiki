@@ -11,6 +11,7 @@ and the source table's invariants.
 A fetcher that fails partway fails as a whole, so its watermark holds.
 The merge prompt's few-shot examples use fictional names and are marked as illustrations.
 Topic pointers can only lead inside topics/.
+Lint checks citations against the archive (fabricated ids, changed dates, bodiless sources).
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -23,7 +24,7 @@ import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Point every configurable location at a throwaway dir BEFORE importing the module, so a
@@ -822,6 +823,111 @@ def test_a_failed_hn_query_fails_the_source_so_the_watermark_holds():
         assert [i.url for i in items] == ["https://example.com/x"]   # deduped on objectID across queries
     finally:
         a.http_get = saved
+
+
+# ── lint ────────────────────────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def capture_logs():
+    """Collect everything the module logs during the block, instead of printing it."""
+    lines: list[str] = []
+    real = a.log
+    a.log = lines.append
+    try:
+        yield lines
+    finally:
+        a.log = real
+
+
+def lint_lines(md: str, known: set[str], facts: dict | None = None) -> list[str]:
+    """The LINT problem lines lint_index reports for `md`."""
+    with capture_logs() as lines:
+        a.lint_index(md, known, facts)
+    return [ln for ln in lines if ln.startswith("LINT ")]
+
+
+def test_lint_checks_ids_against_the_archive_not_the_wiki_just_written():
+    """An id that is in neither the batch nor the archive is reported even though the wiki now contains it."""
+    with sandbox():
+        real = a.Item("src", "sw", "t", "https://x/real", datetime(2026, 10, 1, tzinfo=timezone.utc), "body")
+        a.write_archive([real], "2026-10-01")
+        md = (f"## S\n\n- kept - src, 2026-10-01 [{real.item_id}]\n"
+              "- invented - src, 2026-10-01 [2026-09-09-zz-77]\n")
+        a.write_wiki(md)                                   # callers lint after writing, as main() does
+        problems = lint_lines(md, set(), a.archive_facts())
+        assert any("2026-09-09-zz-77" in p and "fabricated" in p for p in problems), problems
+        assert not any(real.item_id in p for p in problems)
+
+
+def test_lint_flags_a_changed_citation_date_and_a_bodiless_source():
+    """A single-id claim must carry the archived date; a claim on a record with no body is reported."""
+    with sandbox():
+        dated = a.Item("src", "ae", "t", "https://x/dated",
+                       datetime(2025, 1, 6, tzinfo=timezone.utc), "a real body")
+        empty = a.Item("src", "hb", "t", "https://x/empty", datetime(2026, 10, 1, tzinfo=timezone.utc), "")
+        a.write_archive([dated, empty], "2026-10-01")
+        facts = a.archive_facts()
+        assert facts[dated.item_id] == ("2025-01-06", True) and facts[empty.item_id] == ("2026-10-01", False)
+        md = (f"## S\n\n- flipped year - src, 2026-01-06 [{dated.item_id}]\n"
+              f"- no text behind it - src, 2026-10-01 [{empty.item_id}]\n"
+              f"- two sources, newest date by design - src, 2026-10-01 [{dated.item_id}, {empty.item_id}]\n")
+        problems = lint_lines(md, {dated.item_id, empty.item_id}, facts)
+        dates = [p for p in problems if "date differs" in p]
+        assert dates and f"{dated.item_id} cited 2026-01-06, archived 2025-01-06" in dates[0], problems
+        assert dates[0].count(" cited ") == 1                              # the multi-id claim is not checked
+        assert any("no body" in p and empty.item_id in p for p in problems), problems
+        clean = f"## S\n\n- right date - src, 2025-01-06 [{dated.item_id}]\n"
+        assert lint_lines(clean, {dated.item_id}, facts) == []
+
+
+def test_artifact_lint_skips_products_styles_and_possessives_and_lists_every_hit():
+    """Allowlisted names, "-style", and "'s" are not artifacts; real hits are all printed, not the first six."""
+    hits = ["Mecatl", "Wrapture", "ColNanoVDR", "Whiteboard", "AdvSim2Real", "JitAgent", "Recuris"]
+    md = "## S\n\n" + "\n".join([
+        "- Use React-style hooks to configure agents.",
+        "- Utilize OpenAI's Dots agents for triage.",
+        "- Use Claude Code auto mode to skip approvals.",
+        "- Implement Contextual Retrieval with BM25 in RAG systems.",
+        "- Use Claude Managed Agents to host agents.",
+        # The live BaRe-Mem bullet: a paper artifact, so "Bayesian" must not be allowlisted.
+        "- Utilize Bayesian reliability memory (BaRe-Mem) for multi-agent consultation.",
+    ] + [f"- Use {h} to do the thing." for h in hits]) + "\n"
+    problems = lint_lines(md, set(), {})
+    artifact = [p for p in problems if "named artifact" in p]
+    assert len(artifact) == 1, problems
+    assert artifact[0].startswith(f"LINT {len(hits) + 1} bullet(s)")
+    for h in hits + ["Bayesian"]:
+        assert h in artifact[0]
+    for fp in ("React", "OpenAI", "Claude", "Contextual"):
+        assert fp not in artifact[0]
+
+
+def test_lint_skips_archive_checks_when_the_archive_is_empty():
+    """With no archive on disk, cited ids are not called fabricated; the skip is logged instead."""
+    md = "## S\n\n- kept - src, 2026-10-01 [2026-09-09-zz-77]\n"
+    problems = lint_lines(md, set(), {})
+    assert any("archive empty" in p and "skipped" in p for p in problems), problems
+    assert not any("fabricated" in p or "date differs" in p or "no body" in p for p in problems), problems
+    with sandbox():                                        # facts=None reads the (empty) archive itself
+        assert any("archive empty" in p for p in lint_lines(md, set(), None))
+
+
+def test_fetch_log_prints_the_watermark_time_not_just_its_date():
+    """Two runs a day apart must not both log "since <same date>": the line carries the time."""
+    since = (datetime.now(timezone.utc) - timedelta(days=1)).replace(microsecond=0)
+    saved = (a.FETCHERS, a.load_state, sys.argv)
+    try:
+        a.FETCHERS = {k: (lambda *args: []) for k in a.FETCHERS}
+        a.load_state = lambda: {name: since.isoformat() for name, *_ in a.SOURCES}
+        sys.argv = ["ai_research.py", "--dry-run"]
+        with sandbox(), capture_logs() as lines:
+            assert a.main() == 0
+        stamp = since.isoformat(timespec="minutes")
+        assert any(f"new since {stamp}" in ln for ln in lines), lines
+        assert not any(ln.endswith(f"since {since.date()}") for ln in lines)
+    finally:
+        a.FETCHERS, a.load_state, sys.argv = saved
 
 
 if __name__ == "__main__":

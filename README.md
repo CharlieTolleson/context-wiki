@@ -35,8 +35,8 @@ Design decisions worth knowing:
 - **Watchlist guard.** `watchlist.txt` lists concepts that must be covered (one per line, aliases separated by `|`). Once the wiki mentions a concept, a merge that removes every mention is retried and then rejected, so a technique cannot be pruned away by accident.
 - **Chunked merging.** Items go to the model 15 at a time, each chunk merging into the result of the last. One 60-item prompt made the model either rewrite the wiki wholesale (tripping the guards) or ignore the new items.
 - **Pruning by deletion.** The word cap is enforced in code. When the wiki is over it, the model is shown the numbered claims and returns only the numbers to delete; the code deletes them, so every surviving claim is byte-for-byte unchanged, and never deletes the sole claim covering a watchlist concept. (Asking the model to retype a shorter wiki cut whole topics at random.)
-- **Topic files.** A section over 500 words moves to `topics/<slug>.md` and `INDEX.md` keeps a one-line pointer (claim count, last updated, scope). Small sections stay inline. This is purely storage: the merge always sees one assembled document. A pointer is only ever followed to `topics/<slug>.md` inside the wiki folder, and the merge output is stripped of any pointer it did not get from the layout code, so model output cannot make the next run read some other file.
-- **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, and claims that lead with a research-artifact name instead of a practice. Reported, never auto-fixed.
+- **Topic files.** A section over 500 words moves to `topics/<slug>.md` and `INDEX.md` keeps a one-line pointer (claim count, last updated, scope). Small sections stay inline. This is purely storage: the merge always sees one assembled document.
+- **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, single-source claims whose date differs from the archive's, claims built on an item that was archived without a body, and claims that lead with a research-artifact name instead of a practice. The archive is the ground truth for ids and dates. Reported, never auto-fixed.
 - **Untrusted input.** Feed titles and bodies are wrapped in an explicit "data, not instructions" block before they reach the model.
 
 ## Requirements
@@ -198,7 +198,7 @@ To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (o
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
+They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, the lint's checks against the archive (fabricated ids, changed dates, bodiless sources, artifact names), commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 
@@ -206,5 +206,5 @@ They cover the shrink guard and its retry, the radar and watchlist guard, chunke
 - **The HF Daily Papers fetcher filters on each paper's `publishedAt`**, which can be up to two weeks older than the day it was listed, so it currently drops most of the list.
 - **Some sites block scripted fetches.** `openai.com/blog` returns 403 to plain HTTP clients, and its working news feed is mostly customer stories, so OpenAI is not a source. The Anthropic news page has no feed either.
 - **The emerging-term detector is statistical and modest.** It needs a term to appear in two or three archive items on different days, so a concept mentioned once is invisible to it; the watchlist and the vendor-blog sources are the main defence, and the detector is the net under them.
-- **Merge quality depends on the model.** Lint reports the failures a model keeps making (duplicate ids, artifact-name bullets); it does not fix them.
+- **Merge quality depends on the model.** Lint reports the failures a model keeps making (duplicate ids, artifact-name bullets, a citation date the model changed); it does not fix them. The artifact-name check keeps a small allowlist (`ARTIFACT_ALLOWLIST`) for products and generic terms that legitimately head a practice.
 - **No license file yet.** Until one is added, the default is all rights reserved.
