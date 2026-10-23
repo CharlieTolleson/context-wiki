@@ -1150,23 +1150,27 @@ Sources describe named systems, papers, and benchmarks. THE NAME IS NOT THE FIND
 out the transferable practice and state that instead. If you cannot extract one, reject the
 item — do not fall back to describing what the system is or what it beat.
 
-BAD:  JIT-Agent formalizes the agent harness as a composable, machine-generatable artifact,
+BAD:  AcmeHarness formalizes the agent harness as a composable, machine-generatable artifact,
       yielding better performance than static hand-written harnesses.
 GOOD: Generate the agent harness per task at runtime rather than hand-writing one static
-      harness — task-specific harnesses outperform static ones on the same model.
+      harness: task-specific harnesses outperform static ones on the same model.
 
-BAD:  Terminal-Bench-Science offers a framework for evaluating AI systems on scientific
+BAD:  AcmeBench-Science offers a framework for evaluating AI systems on scientific
       research workflows.
-GOOD: (reject — a benchmark existing changes nothing about how you build)
+GOOD: (reject: a benchmark existing changes nothing about how you build)
 
-BAD:  Prefix Sliding improves test-time scaling efficiency by discarding non-essential
+BAD:  AcmePrune improves test-time scaling efficiency by discarding non-essential
       reasoning tokens.
 GOOD: On long reasoning runs, evict non-essential reasoning tokens instead of letting
-      context grow — keeps long-horizon tasks tractable at roughly equal quality.
+      context grow: keeps long-horizon tasks tractable at roughly equal quality.
 
-BAD:  Quantization-Aware Healing enables 4-bit models to outperform full-precision ones.
-GOOD: Prefer 4-bit quantized weights with a healing/repair pass for self-hosted models —
+BAD:  AcmeQuant-Repair enables 4-bit models to outperform full-precision ones.
+GOOD: Prefer 4-bit quantized weights with a healing/repair pass for self-hosted models:
       the memory saving no longer costs accuracy.
+
+The examples above are illustrations of the rewrite, not findings. The "Acme" names are
+made up, the examples have no item id, and they must never appear in the manual. A claim
+can only come from an ingested item.
 
 ## Prioritize, in this order
 1. "The best way to do X has changed" — anything that supersedes current practice.
