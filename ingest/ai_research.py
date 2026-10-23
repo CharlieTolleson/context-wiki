@@ -1590,7 +1590,8 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
     One big prompt overwhelms the merge model: it either rewrites aggressively (tripping the
     guards) or, once corrected, returns the old wiki unchanged. Small chunks keep every call
     inside the range where it reliably integrates new items. A chunk the guards reject is
-    skipped and its items reported as unmerged; the other chunks still land.
+    skipped and its items reported as unmerged; the other chunks still land, and main()
+    holds the watermarks of the unmerged items' sources (hold_watermarks).
 
     Args:
         index_md: Current wiki text.
@@ -1624,8 +1625,37 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         raise MergeRejected(f"all {len(chunks)} merge chunk(s) failed")
     if failures:
         log(f"WARN {failures} of {len(chunks)} chunk(s) failed; their items stay archived, unreviewed "
-            "(--backfill will pick them up)")
+            "(main holds their sources' watermarks: hold_watermarks)")
     return current, merged
+
+
+def hold_watermarks(state: dict, new_state: dict, offered: list[Item], merged: list[Item]) -> list[str]:
+    """Put back the old watermark of every source with an item in a failed merge chunk.
+
+    merge_chunked skips a chunk the guards reject and the rest still land, so main() goes
+    on to save new_state. Without this, every source's watermark advanced past the failed
+    chunk's items: feeds never served them again, so write_archive's re-offer of archived but
+    unmerged URLs never fired, and they were lost to everything but a manual --backfill
+    (audit 2026-10-23). Holding the watermark makes the next run refetch them; items from the
+    same source that did merge are marked reviewed and are skipped then.
+
+    Args:
+        state: Watermarks loaded at the start of the run.
+        new_state: Watermarks about to be saved; updated in place.
+        offered: Items sent to merge_chunked.
+        merged: Items merge_chunked reports as merged.
+
+    Returns:
+        Sorted names of the sources whose watermark was held.
+    """
+    merged_ids = {i.item_id for i in merged}
+    held = sorted({i.source for i in offered if i.item_id not in merged_ids and i.source in new_state})
+    for name in held:
+        if name in state:
+            new_state[name] = state[name]
+        else:
+            del new_state[name]
+    return held
 
 
 PRUNE_TARGET = 0.92      # prune to this fraction of WORD_CAP, so the next merge has headroom
@@ -2325,6 +2355,11 @@ def main() -> int:
     if not updated:
         log("ERROR merge returned empty output; leaving INDEX.md untouched")
         return 1
+
+    held = hold_watermarks(state, new_state, merge_items, merged_items)
+    if held:
+        log(f"WARN watermark held for {', '.join(held)}: a merge chunk with their items failed, "
+            "so the next run refetches them and write_archive re-offers them")
 
     updated = prune_to_cap(updated, creds)
     write_wiki(updated)

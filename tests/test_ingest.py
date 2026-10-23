@@ -761,6 +761,21 @@ def test_accepted_merges_log_the_claims_they_removed():
 # ── chunked merge and pruning ───────────────────────────────────────────────
 
 
+def test_hold_watermarks_keeps_old_watermark_for_sources_in_a_failed_chunk():
+    """A source with an unmerged item keeps its old watermark (or none); fully merged sources advance."""
+    def it(source: str, n: int) -> a.Item:
+        i = a.Item(source, "ab", "t", f"https://x/{source}/{n}", datetime.now(timezone.utc), "body")
+        i.item_id = f"2026-01-01-ab-{source}-{n}"
+        return i
+    offered = [it("blog", 1), it("blog", 2), it("feed", 1), it("newsrc", 1), it("hn-radar", 1)]
+    merged = [offered[0], offered[2]]                     # blog/2, newsrc/1, hn-radar/1 failed
+    state = {"blog": "2026-01-01T00:00:00+00:00", "feed": "2026-01-01T00:00:00+00:00"}
+    new_state = {"blog": "NOW", "feed": "NOW", "newsrc": "NOW"}
+    held = a.hold_watermarks(state, new_state, offered, merged)
+    assert held == ["blog", "newsrc"]                     # hn-radar has no watermark to hold
+    assert new_state == {"blog": state["blog"], "feed": "NOW"}
+
+
 def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
     """Items go to the model MERGE_CHUNK at a time; a rejected chunk is skipped, the rest still land."""
     items = [item("ab", f"https://x/{n}") for n in range(a.MERGE_CHUNK * 2 + 3)]
