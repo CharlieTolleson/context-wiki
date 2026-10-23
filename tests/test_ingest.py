@@ -8,6 +8,7 @@ topic-file split, and the per-card date binding of the html_index scraper.
 Also covers the coverage radar (emerging-term detection, the watchlist and its
 merge guard), chunked merging, deletion-based pruning, thin-item enrichment,
 and the source table's invariants.
+A fetcher that fails partway fails as a whole, so its watermark holds.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -742,6 +743,38 @@ def test_radar_queries_put_watchlist_first_dedupe_and_stay_capped():
         report = a.radar_scan("## nothing\n", None)
         assert len(report.missing) == 9
         assert report.queries == [f"concept number {n}" for n in range(a.RADAR_WATCHLIST_SLOTS)]
+
+
+# ── fetchers ────────────────────────────────────────────────────────────────
+
+
+def test_a_failed_hn_query_fails_the_source_so_the_watermark_holds():
+    """One failed topic query raises (main() then holds the watermark); all queries ok returns hits."""
+    import json
+    import urllib.error
+
+    hit = {"objectID": "1", "title": "t", "url": "https://example.com/x", "created_at": "2026-10-01T00:00:00Z",
+           "points": 100, "num_comments": 3}
+    saved = a.http_get
+
+    def flaky(url: str) -> str:
+        if "query=" + a.HN_QUERIES[0].replace(" ", "+") in url:
+            raise urllib.error.URLError("timed out")
+        return json.dumps({"hits": [hit]})
+
+    since = datetime(2026, 9, 30, tzinfo=timezone.utc)
+    try:
+        a.http_get = flaky
+        try:
+            a.fetch_hn("hackernews", "hn", "https://hn.example/api", since)
+            raise AssertionError("expected a RuntimeError")
+        except RuntimeError as exc:
+            assert "1 of" in str(exc)
+        a.http_get = lambda url: json.dumps({"hits": [hit]})
+        items = a.fetch_hn("hackernews", "hn", "https://hn.example/api", since)
+        assert [i.url for i in items] == ["https://example.com/x"]   # deduped on objectID across queries
+    finally:
+        a.http_get = saved
 
 
 if __name__ == "__main__":

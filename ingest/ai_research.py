@@ -506,9 +506,18 @@ def fetch_hn(name: str, slug: str, url: str, since: datetime) -> list[Item]:
     pulling the unfiltered front page, which is dominated by news, obituaries,
     and hobby projects irrelevant to a systems-engineering wiki. Results are
     unioned and deduped on objectID.
+
+    Raises:
+        RuntimeError: when any topic query failed. A partial result would still
+            advance the watermark in main(), losing whatever the failed query
+            would have returned for good (seen once in the run log: an 'LLM'
+            query URLError, and the watermark moved anyway). Raising makes main() count a source
+            failure and hold the watermark, so the next run re-queries the
+            whole window, as Decision 2 intends.
     """
     seen: set[str] = set()
     items: list[Item] = []
+    failed: list[str] = []
     for query in HN_QUERIES:
         params = urllib.parse.urlencode({
             "query": query,
@@ -520,6 +529,7 @@ def fetch_hn(name: str, slug: str, url: str, since: datetime) -> list[Item]:
             data = json.loads(http_get(f"{url}?{params}"))
         except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
             log(f"  WARN hn query {query!r}: {type(exc).__name__}")
+            failed.append(query)
             continue
         for hit in data.get("hits", []):
             oid = str(hit.get("objectID", ""))
@@ -535,6 +545,8 @@ def fetch_hn(name: str, slug: str, url: str, since: datetime) -> list[Item]:
                 f"https://news.ycombinator.com/item?id={oid})"
             )
             items.append(Item(name, slug, hit.get("title", ""), link, pub, body[:MAX_BODY_CHARS]))
+    if failed:
+        raise RuntimeError(f"{len(failed)} of {len(HN_QUERIES)} queries failed ({', '.join(failed)})")
     return items
 
 
