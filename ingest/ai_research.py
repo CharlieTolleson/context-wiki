@@ -1045,14 +1045,51 @@ def filter_candidates(cands: list["radar.Candidate"], window: list[Item],
             model=RADAR_MODEL, max_tokens=2000,   # headroom: the cheap alias may spend tokens thinking
             messages=[{"role": "user", "content": prompt}])
         raw = resp.choices[0].message.content or ""
-        found = re.search(r"\[[\d,\s]*\]", raw)
-        if not found:
+        picked = parse_radar_picks(raw, cands)
+        if picked is None:
             raise ValueError(f"no JSON array in reply {raw[:80]!r} (finish_reason={resp.choices[0].finish_reason})")
-        picked = json.loads(found.group(0))
-        return [cands[i] for i in picked if isinstance(i, int) and 0 <= i < len(cands)][:8]
+        return picked
     except Exception as exc:
         log(f"WARN radar filter failed: {type(exc).__name__}: {str(exc)[:100]}")
         return []
+
+
+def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.Candidate"] | None:
+    """Read the radar filter's reply: a JSON array of candidate numbers or of the terms themselves.
+
+    The prompt asks for numbers, but the cheap model sometimes answers with the terms
+    (the 2026-10-23 run got a fenced ["embeddinggemma", "vllm", ...] and the whole filter
+    failed, so the radar flagged nothing). A term only counts when it matches a candidate's
+    term exactly (case-insensitive), so the reply can never add a term of its own.
+
+    Args:
+        raw: the model's reply text, possibly wrapped in a ```json fence or prose.
+        cands: the candidates the prompt listed, in prompt order.
+
+    Returns:
+        Up to 8 picked candidates, de-duplicated in reply order; None when the reply holds
+        no parseable JSON array (the caller logs that as a filter failure).
+    """
+    found = re.search(r"\[[^\[\]]*\]", raw)
+    if not found:
+        return None
+    try:
+        values = json.loads(found.group(0))
+    except json.JSONDecodeError:
+        return None
+    by_term = {c.term.lower(): c for c in cands}
+    picked: list["radar.Candidate"] = []
+    for v in values:
+        # bool is an int subclass; json never yields True for a number, but be explicit.
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < len(cands):
+            c = cands[v]
+        elif isinstance(v, str) and v.strip().lower() in by_term:
+            c = by_term[v.strip().lower()]
+        else:
+            continue
+        if c not in picked:
+            picked.append(c)
+    return picked[:8]
 
 
 def radar_scan(wiki_text: str, creds: dict[str, str] | None) -> RadarReport:

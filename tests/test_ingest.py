@@ -14,6 +14,7 @@ Topic pointers can only lead inside topics/.
 Lint checks citations against the archive (fabricated ids, changed dates, bodiless sources).
 The merge prompt's untrusted block neutralises delimiter variants and spoofed item headers.
 Small merge batches are quota-capped per source, and the HF papers fetcher selects by listing day.
+The radar filter's reply parser accepts candidate numbers or listed terms, fenced or not.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -1059,6 +1060,33 @@ def test_hf_papers_keeps_papers_listed_today_but_published_earlier():
     assert [it.url for it in items] == ["https://huggingface.co/papers/2510.01234"]
     assert items[0].published == published                  # publishedAt is kept for attribution
     assert items[0].body == "abstract"
+
+
+def _radar_cands(*terms: str) -> list:
+    """Radar candidates with the given terms and placeholder evidence counts."""
+    return [radar.Candidate(term=t, key=t.replace(" ", ""), items=3, sources=2, in_titles=0, baseline=0)
+            for t in terms]
+
+
+def test_radar_picks_accept_numbers_in_a_fence():
+    """A fenced array of numbers picks those candidates in reply order; out-of-range numbers are ignored."""
+    cands = _radar_cands("codemode", "france", "tool search")
+    picked = a.parse_radar_picks("```json\n[2, 0, 9]\n```", cands)
+    assert [c.term for c in picked] == ["tool search", "codemode"]
+
+
+def test_radar_picks_accept_terms_but_only_listed_ones():
+    """A reply of terms (the 2026-10-23 failure) maps back to candidates; an unlisted term is dropped."""
+    cands = _radar_cands("embeddinggemma", "vllm", "france")
+    raw = '```json\n[\n    "embeddinggemma",\n    "VLLM",\n    "deepinfer",\n    "vllm"\n]\n```'
+    picked = a.parse_radar_picks(raw, cands)
+    assert [c.term for c in picked] == ["embeddinggemma", "vllm"]
+
+
+def test_radar_picks_none_without_an_array():
+    """A reply with no JSON array returns None so the caller logs a filter failure."""
+    assert a.parse_radar_picks("I cannot help with that.", _radar_cands("vllm")) is None
+    assert a.parse_radar_picks("[not json]", _radar_cands("vllm")) is None
 
 
 if __name__ == "__main__":
