@@ -1085,10 +1085,11 @@ def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.C
         cands: the candidates the prompt listed, in prompt order.
 
     Returns:
-        Up to 8 picked candidates, de-duplicated in reply order, from the last array of
-        numbers or, when there is none, the last array that names a candidate; [] when arrays
-        parse but name none; None when the reply holds no parseable array (the caller logs
-        that as a filter failure).
+        Up to 8 picked candidates, de-duplicated in reply order. The answer is found by
+        structure, not position: a reply (or ```json fence) that is itself JSON is read
+        directly; otherwise the first bracketed array that names a candidate wins. [] when
+        the answer names no candidate; None when the reply holds no parseable array, or is a
+        JSON object with no answer key (the caller logs that as a filter failure).
     """
     by_term = {c.term.lower(): c for c in cands}
 
@@ -1109,26 +1110,9 @@ def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.C
             return cands[n] if 0 <= n < len(cands) else None
         return by_term.get(v.strip().strip("'\"").strip().lower()) if isinstance(v, str) else None
 
-    # Every bracket is tried, not only the first: a reply that thinks aloud ("maybe
-    # [codemode]?") or cites "[notes]" before its answer would otherwise fail. An array of
-    # numbers is the format asked for, so the last one wins (including "[]", none qualify)
-    # even when the reply quotes candidate terms earlier; only a reply with no number array
-    # is read as terms, and then the last array that names a candidate is the answer.
-    arrays: list[list] = []
-    for found in re.finditer(r"\[[^\[\]]*\]", raw):
-        try:
-            values = json.loads(found.group(0))
-        except ValueError:      # JSONDecodeError, or an int past the digit limit
-            try:
-                values = ast.literal_eval(found.group(0))   # a Python-style ['vllm', 'codemode']
-            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
-                continue
-        if isinstance(values, list):
-            arrays.append(values)
-    if not arrays:
-        return None
-
     def picks(values: list) -> list["radar.Candidate"]:
+        if len(values) == 1 and isinstance(values[0], list):
+            values = values[0]      # [[0, 2]]
         out: list["radar.Candidate"] = []
         for v in values:
             c = pick(v)
@@ -1136,12 +1120,57 @@ def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.C
                 out.append(c)
         return out[:8]
 
-    numeric = [v for v in arrays if all(as_number(x) is not None for x in v)]
-    if numeric:
-        return picks(numeric[-1])
-    for values in reversed(arrays):
+    def load(text: str) -> object:
+        try:
+            return json.loads(text)
+        except ValueError:      # JSONDecodeError, or an int past the digit limit
+            try:
+                return ast.literal_eval(text)   # a Python-style ['vllm', 'codemode']
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                return None
+
+    def answer_of(obj: dict) -> list | None:
+        # {"picks": [0, 2], "rejected": [1, 3]}: only an answer-style key counts, never the
+        # rejected, excluded, or considered list, so a lone list under such a key is no answer.
+        lists = {str(k).lower(): v for k, v in obj.items() if isinstance(v, list)}
+        for key in ("picks", "picked", "keep", "kept", "selected", "selection", "answer",
+                    "terms", "result", "results", "numbers"):
+            if key in lists:
+                return lists[key]
+        if len(lists) == 1:
+            key, values = next(iter(lists.items()))
+            if not re.search(r"reject|exclu|consider|candidate|skip|drop|discard|other|not", key):
+                return values
+        return None
+
+    # Reasoning is not the answer: drop <think> blocks (and a dangling close tag's prefix,
+    # when the provider strips the opening tag) before looking at any bracket.
+    text = re.sub(r"<think>.*?</think>", " ", raw, flags=re.S | re.I)
+    text = re.sub(r"^.*</think>", " ", text, flags=re.S | re.I).strip()
+
+    # The reply, or a fenced block in it, is JSON: its structure says which list is the
+    # answer, so trailing prose ("Excluded [1, 3]") or a "rejected" key never competes.
+    for block in [text] + re.findall(r"```[a-zA-Z]*\s*\n?(.*?)```", text, flags=re.S):
+        obj = load(block.strip())
+        if isinstance(obj, list):
+            return picks(obj)
+        if isinstance(obj, dict):
+            values = answer_of(obj)
+            return picks(values) if values is not None else None
+
+    # Prose around the answer: take the first array that names a candidate. Arrays that
+    # name none (a thought like "maybe [9]?", "[notes]", a year, an empty "Others: []") are
+    # skipped, so they neither hide nor override the answer.
+    found_any = False
+    for found in re.finditer(r"\[[^\[\]]*\]", text):
+        values = load(found.group(0))
+        if not isinstance(values, list):
+            continue
+        found_any = True
         if picked := picks(values):
             return picked
+    if not found_any:
+        return None
     log(f"NOTE radar filter reply arrays matched no candidate: {raw[:80]!r}")
     return []
 

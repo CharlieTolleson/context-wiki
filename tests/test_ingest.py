@@ -1178,13 +1178,33 @@ def test_radar_picks_accept_python_style_and_quoted_number_replies():
     assert a.parse_radar_picks("[]", cands) == []
 
 
-def test_radar_picks_prefer_the_number_answer_over_quoted_terms():
-    """Candidate terms quoted before the answer are not picks; an explicit [] means none."""
-    cands = _radar_cands("codemode", "france", "tool search")
-    raw = 'Of ["codemode", "france", "tool search"], the techniques are: [0, 2]'
-    assert [c.term for c in a.parse_radar_picks(raw, cands)] == ["codemode", "tool search"]
-    assert a.parse_radar_picks('Candidates: ["codemode", "france"]. None qualify: []', cands) == []
-    assert [c.term for c in a.parse_radar_picks('maybe ["france"]? final: ["codemode"]', cands)] == ["codemode"]
+_RADAR_REPLY_CASES = [
+    # Trailing prose, an echo of the candidates, or a "rejected" list never overrides the answer.
+    ('```json\n[0, 2]\n```\nExcluded [1, 3]: place names.', ["codemode", "tool search"]),
+    ('{"picks": [0, 2], "rejected": [1, 3]}', ["codemode", "tool search"]),
+    ('{"keep": ["codemode", "tool search"], "reject": ["france", "paris"]}', ["codemode", "tool search"]),
+    ('[0, 2]\n\nConsidered: [0, 1, 2, 3]', ["codemode", "tool search"]),
+    # A bracketed citation, year, or empty note after a terms answer is not the answer.
+    ('Answer: ["codemode"] (per line [1])', ["codemode"]),
+    ('["codemode", "tool search"] (news from [2026])', ["codemode", "tool search"]),
+    ('["codemode"]\nOthers: []', ["codemode"]),
+    # Thinking before the answer: out-of-range or unlisted guesses and <think> blocks are skipped.
+    ("maybe [9]? final: [0]", ["codemode"]),
+    ('maybe ["deepinfer"]? final: ["codemode"]', ["codemode"]),
+    ("<think>[1]? no.</think>[0]", ["codemode"]),
+    ("[1]? no.</think>\n[0]", ["codemode"]),
+    ('{"rejected": [1, 3]}', None),
+    ('Candidates: ["vllm"]. None qualify: []', []),
+]
+
+
+def test_radar_picks_read_the_answer_by_structure_not_position():
+    """The answer is the JSON reply (or its answer key), else the first array naming a candidate."""
+    cands = _radar_cands("codemode", "france", "tool search", "paris")
+    for raw, want in _RADAR_REPLY_CASES:
+        picked = a.parse_radar_picks(raw, cands)
+        got = None if picked is None else [c.term for c in picked]
+        assert got == want, raw
 
 
 def test_radar_picks_survive_odd_digits():
