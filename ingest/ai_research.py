@@ -1452,23 +1452,50 @@ def merge_index(index_md: str, items: list[Item], creds: dict[str, str],
     # A reply cut at max_tokens has lost its tail sections. If that is under a quarter of the
     # claims the shrink guard would accept it, so a truncated wiki is never returned: "" makes
     # merge_checked/merge_chunked treat the chunk as failed and its items stay archived.
-    if resp.choices[0].finish_reason == "length":
+    # "max_tokens" is the Anthropic spelling, passed through by some OpenAI-compatible gateways.
+    if resp.choices[0].finish_reason in ("length", "max_tokens"):
         log("WARN merge reply hit max_tokens (finish_reason=length); discarding it")
         return ""
-    out = (resp.choices[0].message.content or "").strip()
-    # Models sometimes wrap the wiki in a fence and add prose after it ("Let me know if...").
-    # Stripping a fence only at the very ends stored that chatter in the wiki, so unwrap from
-    # the opening fence to the LAST closing fence line. Going to the last one keeps a code
-    # block inside the wiki intact; only line-anchored ``` count, so inline `code` is untouched.
-    opening = (re.match(r"```(?:markdown|md)?[ \t]*\n", out)
-               or re.search(r"^```(?:markdown|md)[ \t]*\n", out, re.M))
-    if opening:
-        body = out[opening.end():]
-        closes = list(re.finditer(r"^[ \t]*```[ \t]*$", body, re.M))
-        out = body[:closes[-1].start()] if closes else body
-    else:
-        out = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", out)  # strip stray fences
-    return out.strip()
+    return unwrap_reply((resp.choices[0].message.content or "").strip())
+
+
+FENCE_LINE_RE = re.compile(r"^[ \t]*```[ \t]*([\w+-]*)[ \t]*$", re.M)
+
+
+def unwrap_reply(out: str) -> str:
+    """Return the wiki from a model reply, without a wrapping fence or prose around it.
+
+    Models sometimes wrap the wiki in a fence and add prose after it ("Let me know if...");
+    stripping a fence only at the very ends stored that chatter in the wiki. A fence counts as
+    the wrapper only when the reply opens with it or with a few lines of prose that hold no
+    heading or bullet, so a ```markdown example inside an unfenced wiki is never taken for
+    one. The wrapper closes at the first bare ``` that does not close an inner ```lang block;
+    if a heading or a cited claim still follows that line, it was a bare inner block, so the
+    last fence closes instead.
+    """
+    fences = list(FENCE_LINE_RE.finditer(out))
+    opening = fences[0] if fences else None
+    if opening and opening.group(1) not in ("", "markdown", "md"):
+        opening = None
+    if opening and opening.start() > 0:
+        before = [ln for ln in out[:opening.start()].splitlines() if ln.strip()]
+        if len(before) > 2 or any(re.match(r"\s*(#|[-*] )", ln) for ln in before):
+            opening = None
+    if not opening:
+        return re.sub(r"^```(?:markdown)?\s*|\s*```$", "", out).strip()  # strip stray fences
+    body_start = opening.end() + 1
+    inner, close = False, None
+    for f in fences[1:]:
+        if f.group(1):
+            inner = True
+        elif inner:
+            inner = False
+        else:
+            close = f
+            break
+    if close and re.search(r"^(## |- .*\[\d{4}-\d{2}-\d{2}-)", out[close.end():], re.M):
+        close = fences[-1] if fences[-1] is not opening else None
+    return (out[body_start:close.start()] if close else out[body_start:]).strip()
 
 
 # ── Shrink guard ────────────────────────────────────────────────────────────

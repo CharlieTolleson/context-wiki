@@ -184,6 +184,29 @@ def test_merge_index_unwraps_a_fenced_reply_and_drops_trailing_prose():
     assert _merge_reply(f"Here is the wiki:\n```markdown\n{wiki}\n```\nDone.") == wiki
     assert _merge_reply(f"```\n{wiki}\n```") == wiki
     assert _merge_reply(wiki) == wiki                 # unfenced reply: code block untouched
+    bare = "## S\n\n- One [2026-01-01-ab-01]\n\n```\nx = 1\n```\n\n- Two [2026-01-01-ab-02]"
+    assert _merge_reply(f"```markdown\n{bare}\n```") == bare   # a bare inner block survives
+    assert _merge_reply(f"Here is the wiki:\n```\n{wiki}\n```") == wiki
+
+
+def test_merge_index_keeps_an_unfenced_wiki_holding_a_markdown_block():
+    """A ```markdown example inside an unfenced wiki is not mistaken for a wrapper."""
+    wiki = ("## Context\n\n- Keep CLAUDE.md short [2026-01-01-ab-01]\n- Example:\n\n"
+            "```markdown\n# Project\n- run tests\n```\n\n## Evals\n\n- Grade transcripts [2026-01-01-ab-02]")
+    assert _merge_reply(wiki) == wiki
+
+
+def test_merge_index_drops_trailing_prose_that_holds_its_own_fence():
+    """The wrapper closes at the first unpaired fence, not the last one in the reply."""
+    wiki = "## S\n\n- x [2026-01-01-ab-01]"
+    assert _merge_reply(f"```markdown\n{wiki}\n```\nChanges:\n```diff\n+ x\n```") == wiki
+
+
+def test_merge_index_finish_reason_none_or_max_tokens():
+    """None is a normal reply; the Anthropic spelling of a cut reply is discarded too."""
+    wiki = doc(9)
+    assert _merge_reply(wiki, finish_reason=None) == wiki.strip()
+    assert _merge_reply(wiki, finish_reason="max_tokens") == ""
 
 
 # ── merge prompt: untrusted item block ──────────────────────────────────────
