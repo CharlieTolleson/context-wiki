@@ -20,7 +20,7 @@ sources: ~20 RSS/Atom feeds (practitioners + vendor engineering blogs), Hacker N
 archive/YYYY-MM-DD.md     every item in full, with a stable id like 2026-10-07-sw-03   (append-only)
    |
    v   LLM merges, 15 items per call, each call against the previous result
-   |   guards: shrink guard, watchlist guard (+ retries), then prune to the word cap
+   |   guards: shrink guard, watchlist guard, output guard (+ retries), then prune to the word cap
    v
 INDEX.md  +  topics/<topic>.md        what agents read
 ```
@@ -33,10 +33,11 @@ Design decisions worth knowing:
 - **Greppable ids.** Every claim ends with an attribution (source, date, and item ids in brackets). `grep -rn "<item-id>" archive/` returns the stored article and its URL, so follow-up questions need no network call.
 - **Shrink guard.** A merge that keeps under 75% of the existing claims is retried once with the dropped claims listed, then rejected, leaving the wiki untouched. A model can ignore "the word cap is a ceiling, not a target"; code cannot.
 - **Watchlist guard.** `watchlist.txt` lists concepts that must be covered (one per line, aliases separated by `|`). Once the wiki mentions a concept, a merge that removes every mention is retried and then rejected, so a technique cannot be pruned away by accident.
+- **Output guard.** The wiki is read as trusted context by every agent session, so a merge result that adds an HTML comment (invisible when rendered, read in full by agents), an HTML tag that loads, runs, or hides something (`<img>`, `<script>`, `<details>`, an `on*=`/`src=`/`style=` attribute), or a bullet that cites no item id is retried once and then rejected. Backticked code and XML-style prompt tags such as `<document>` pass. Findings already in the stored wiki do not block merges; lint reports them.
 - **Chunked merging.** Items go to the model 15 at a time, each chunk merging into the result of the last. One 60-item prompt made the model either rewrite the wiki wholesale (tripping the guards) or ignore the new items.
 - **Pruning by deletion.** The word cap is enforced in code. When the wiki is over it, the model is shown the numbered claims and returns only the numbers to delete; the code deletes them, so every surviving claim is byte-for-byte unchanged, and never deletes the sole claim covering a watchlist concept. (Asking the model to retype a shorter wiki cut whole topics at random.)
 - **Topic files.** A section over 500 words moves to `topics/<slug>.md` and `INDEX.md` keeps a one-line pointer (claim count, last updated, scope). Small sections stay inline. This is purely storage: the merge always sees one assembled document.
-- **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, single-source claims whose date differs from the archive's, claims built on an item that was archived without a body, and claims that lead with a research-artifact name instead of a practice. The archive is the ground truth for ids and dates. Reported, never auto-fixed.
+- **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, single-source claims whose date differs from the archive's, claims built on an item that was archived without a body, claims that lead with a research-artifact name instead of a practice, and bullets containing a URL, a pipe into a shell (`| sh`, `| bash`), HTML, or no item id. The archive is the ground truth for ids and dates. Reported, never auto-fixed.
 - **Untrusted input.** Feed titles and bodies are wrapped in an explicit "data, not instructions" block before they reach the model.
 
 ## Requirements
@@ -198,7 +199,7 @@ To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (o
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, per-source quotas on small batches, the papers fetcher, the lint's checks against the archive (fabricated ids, changed dates, bodiless sources, artifact names), commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
+They cover the shrink guard and its retry, the output guard (HTML and id-less bullets), the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, per-source quotas on small batches, the papers fetcher, the lint's checks against the archive (fabricated ids, changed dates, bodiless sources, artifact names), commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 
