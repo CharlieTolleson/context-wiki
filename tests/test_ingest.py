@@ -815,7 +815,65 @@ def test_prune_deletes_selected_claims_and_spares_sole_watchlist_coverage():
         assert "code mode" in out                       # claim 7 was picked but is the sole carrier
         kept = [l for l in out.splitlines() if l.startswith("- ")]
         assert all(l in lines for l in kept)            # survivors are untouched
-        assert len(kept) == 40 - 19                     # 20 picked, 1 spared
+        # Picks are deleted in order (skipping the spared 7) only until the target is met.
+        gone = [n for n in range(40) if lines[n] not in kept]
+        assert gone == [n for n in range(20) if n != 7][:len(gone)]
+        target = int(a.WORD_CAP * a.PRUNE_TARGET)
+        assert len(out.split()) <= target < len(out.split()) + len(lines[gone[-1]].split())
+
+
+class _PruneClient:
+    """Fake OpenAI client whose nth prune reply is replies[n] (a list of claim numbers)."""
+    replies: list = []
+    calls = 0
+
+    def __init__(self, **kw):
+        self.chat = type("C", (), {"completions": self})()
+
+    def create(self, **kw):
+        reply = _PruneClient.replies[min(_PruneClient.calls, len(_PruneClient.replies) - 1)]
+        _PruneClient.calls += 1
+        msg = type("M", (), {"content": str(reply)})()
+        return type("R", (), {"choices": [type("Ch", (), {"message": msg})()]})()
+
+
+def _prune_with(wiki: str, replies: list) -> str:
+    """Run prune_to_cap against _PruneClient serving `replies`."""
+    import openai
+    _PruneClient.replies, _PruneClient.calls = replies, 0
+    real = openai.OpenAI
+    openai.OpenAI = _PruneClient
+    try:
+        return a.prune_to_cap(wiki, {"base_url": "x", "api_key": "y"})
+    finally:
+        openai.OpenAI = real
+
+
+def test_prune_reply_naming_every_claim_stops_at_target_and_floor():
+    """A reply listing every claim number deletes only down to the word target, never below the floor."""
+    with sandbox():
+        filler = " ".join(["word"] * 60)
+        lines = [f"- {filler} number {n} [2026-01-01-ab-{n:02d}]" for n in range(40)]
+        wiki = "## S\n\n" + "\n".join(lines) + "\n"
+        out = _prune_with(wiki, [list(range(40))])
+        kept = a.count_claims(out)
+        assert kept >= a.claim_floor(wiki)
+        assert kept > 20                                    # was 0 before the bound
+        assert len(out.split()) <= a.WORD_CAP
+
+
+def test_prune_logs_each_deleted_claim_once_across_passes():
+    """A two-pass prune appends one dropped_claims.jsonl line per deleted claim, not repeats."""
+    with sandbox():
+        filler = " ".join(["word"] * 60)
+        lines = [f"- {filler} number {n} [2026-01-01-ab-{n:02d}]" for n in range(40)]
+        wiki = "## S\n\n" + "\n".join(lines) + "\n"
+        # Pass 1 deletes two claims (still over the cap); pass 2's numbers refer to the shorter list.
+        out = _prune_with(wiki, [[0, 1], list(range(20))])
+        deleted = 40 - a.count_claims(out)
+        assert deleted > 2
+        logged = a.DROPPED_PATH.read_text().splitlines()
+        assert len(logged) == deleted
 
 
 # ── sources, feeds, enrichment ──────────────────────────────────────────────
