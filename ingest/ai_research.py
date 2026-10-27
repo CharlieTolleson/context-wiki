@@ -1609,6 +1609,11 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
     inside the range where it reliably integrates new items. A chunk the guards reject is
     skipped and its items reported as unmerged; the other chunks still land.
 
+    merge_checked measures each chunk against the previous chunk's result, so on its own the
+    shrink floor compounds: four chunks that each keep 76% end a run with a third of the wiki,
+    the 2026-10-02 failure the guard exists to stop. Every chunk must therefore also keep the
+    floor of the wiki the run started from.
+
     Args:
         index_md: Current wiki text.
         items: Items to merge, already selected (select_for_merge).
@@ -1622,6 +1627,7 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         MergeRejected: Every chunk failed, so nothing was merged.
     """
     current, merged, failures = index_md, [], 0
+    run_floor = claim_floor(index_md)
     chunks = [items[i:i + MERGE_CHUNK] for i in range(0, len(items), MERGE_CHUNK)]
     for n, chunk in enumerate(chunks, start=1):
         try:
@@ -1633,6 +1639,11 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         if not out:
             failures += 1
             log(f"WARN chunk {n}/{len(chunks)} returned empty output")
+            continue
+        if count_claims(out) < run_floor:
+            failures += 1
+            log(f"WARN chunk {n}/{len(chunks)} rejected: {count_claims(out)} claims, under the "
+                f"run's floor of {run_floor} (the wiki started with {count_claims(index_md)})")
             continue
         current = out
         merged.extend(chunk)

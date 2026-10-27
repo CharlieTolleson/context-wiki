@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -771,6 +772,24 @@ def test_accepted_merges_log_the_claims_they_removed():
 
 
 # ── chunked merge and pruning ───────────────────────────────────────────────
+
+
+def test_merge_chunked_holds_the_run_floor_across_chunks():
+    """Each chunk may pass its own floor, but the run cannot erode below the starting wiki's floor."""
+    items = [item("ab", f"https://x/{n}") for n in range(a.MERGE_CHUNK * 4)]
+    start = doc(40)
+    real = a.merge_checked
+
+    def fake(index_md, chunk, creds, hint="", retries=1):
+        keep = math.ceil(a.count_claims(index_md) * 0.8)          # passes merge_checked's own 75% floor
+        return doc(keep)
+    try:
+        a.merge_checked = fake
+        out, merged = a.merge_chunked(start, items, {})
+    finally:
+        a.merge_checked = real
+    assert a.count_claims(out) >= a.claim_floor(start)
+    assert len(merged) < len(items)                                # the eroding chunks were refused
 
 
 def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
