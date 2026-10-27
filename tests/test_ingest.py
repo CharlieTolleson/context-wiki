@@ -283,6 +283,20 @@ def _lock_is_free() -> bool:
         os.close(fd)
 
 
+def test_run_lock_sweeps_temp_files_left_by_a_killed_run():
+    """An orphaned atomic_write temp file is removed before it can be committed; real files stay."""
+    with sandbox() as tmp:
+        a.ARCHIVE_DIR.mkdir()
+        orphan = a.ARCHIVE_DIR / ".2026-10-27.md.k3j2.tmp"
+        orphan.write_text("half")
+        keep = a.ARCHIVE_DIR / "2026-10-27.md"
+        keep.write_text("# Archive\n")
+        (tmp / ".INDEX.md.abcd.tmp").write_text("half")
+        with a.run_lock():
+            pass
+        assert not orphan.exists() and not (tmp / ".INDEX.md.abcd.tmp").exists() and keep.exists()
+
+
 def test_writing_modes_hold_the_run_lock_and_release_it_after():
     """--add-url runs under the lock (a second run would have to wait); it is freed afterwards."""
     with sandbox():

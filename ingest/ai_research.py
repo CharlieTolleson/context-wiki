@@ -869,6 +869,20 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def sweep_temp_files() -> None:
+    """Delete atomic_write temp files left by a run that was killed mid-write.
+
+    The cleanup in atomic_write does not run on SIGKILL, or on the SIGTERM launchd sends on
+    unload, and commit() stages ARCHIVE_DIR and TOPICS_DIR whole, so an orphan would be
+    committed and kept forever. Called with the run lock held, so no live write is touched.
+    """
+    for folder in {WIKI_DIR, TOPICS_DIR, ARCHIVE_DIR, STATE_DIR}:
+        for tmp in folder.glob(".*.tmp") if folder.is_dir() else ():
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+                log(f"removed {tmp.name}, left by an interrupted run")
+
+
 def _write_if_changed(path: Path, text: str) -> None:
     if not path.exists() or path.read_text() != text:
         atomic_write(path, text)
@@ -2239,6 +2253,7 @@ def run_lock():
         except BlockingIOError:
             log("another run holds the lock; waiting for it to finish")
             fcntl.flock(fd, fcntl.LOCK_EX)
+        sweep_temp_files()
         yield
     finally:
         os.close(fd)  # closing the descriptor releases the lock
