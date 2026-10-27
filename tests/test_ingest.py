@@ -709,13 +709,38 @@ def test_a_coinage_in_two_items_on_two_days_is_an_emerging_term(monkeypatch):
 
 
 def test_coinage_does_not_depend_on_which_spelling_comes_first(monkeypatch):
-    """'codemode' then 'code mode' and the reverse order both report the coinage."""
+    """'codemode' then 'code mode' and the reverse order both report the coinage, shown as one token."""
     monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS)
     one = arch_item("2026-10-02-ls-01", "latent-space", "codemode is here", "")
     two = arch_item("2026-10-03-ls-01", "latent-space", "code mode again", "")
-    filler = arch_item("2026-10-03-nw-01", "news", "filler", "")
-    for window in ([one, two, filler], [two, one, filler]):
-        assert "codemode" in [c.key for c in radar.emerging_terms(window, [], "")]
+    three = arch_item("2026-10-04-ls-01", "latent-space", "codemode support", "")
+    for window in ([one, two, three], [two, one, three], [two, three, one]):
+        found = {c.key: c.term for c in radar.emerging_terms(window, [], "")}
+        assert found.get("codemode") == "codemode"
+
+
+def test_one_hashtag_does_not_make_an_ordinary_phrase_a_coinage(monkeypatch):
+    """A single '#PromptCaching' leaves 'prompt caching' under phrase rules and spelled with a space."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS | {"prompt", "cache"})
+    window = [arch_item("2026-10-02-aa-01", "a", "#PromptCaching tips", ""),
+              arch_item("2026-10-03-aa-01", "a", "prompt caching again", ""),
+              arch_item("2026-10-04-bb-01", "b", "filler", "")]
+    assert "promptcaching" not in [c.key for c in radar.emerging_terms(window, [], "")]
+    window[2] = arch_item("2026-10-04-bb-01", "b", "prompt caching here", "")
+    found = {c.key: c.term for c in radar.emerging_terms(window, [], "")}
+    assert found.get("promptcaching") == "prompt caching"
+
+
+def test_the_baseline_is_searched_with_every_spaced_spelling(monkeypatch):
+    """'openai agents' and 'open ai agents' are one term, whichever spelling the window shows first."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS | {"open", "agent", "launch"})
+    first = arch_item("2026-10-02-aa-01", "a", "openai agents launch", "")
+    second = arch_item("2026-10-03-bb-01", "b", "open ai agents", "")
+    third = arch_item("2026-10-03-cc-01", "c", "openai agents", "")
+    baseline = [arch_item(f"2026-08-0{d}-zz-01", "z", "open ai agents everywhere", "") for d in range(1, 8)]
+    for window in ([first, second, third], [second, first, third]):
+        assert "openaiagents" in [c.key for c in radar.emerging_terms(window, [], "")]
+        assert "openaiagents" not in [c.key for c in radar.emerging_terms(window, baseline, "")]
 
 
 def test_an_established_spaced_term_is_not_new_when_also_written_as_one_token(monkeypatch):
@@ -739,8 +764,9 @@ def test_without_a_word_list_single_words_need_phrase_evidence(monkeypatch):
     assert "announcing" in [c.key for c in radar.emerging_terms(window, [], "")]
 
 
-def test_an_ordinary_phrase_needs_two_independent_sources():
+def test_an_ordinary_phrase_needs_two_independent_sources(monkeypatch):
     """A common-word phrase from a single source is not a trend, even if it repeats."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS)
     one_source = [arch_item(f"2026-10-0{d}-ab-01", "only-one", "t", "the early access program") for d in (1, 2, 3)]
     has = lambda items: [c for c in radar.emerging_terms(items, [], "") if "early access" in c.term]
     assert not has(one_source)

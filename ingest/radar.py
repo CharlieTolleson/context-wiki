@@ -137,7 +137,7 @@ def collapse(text: str) -> str:
 
 
 def _ngrams(text: str) -> dict[str, set[str]]:
-    """Candidate phrases in `text` as {key: display}. One to three tokens, no edge stopwords."""
+    """Candidate phrases in `text` as {key: every spelling seen}. One to three tokens, no edge stopwords."""
     text = CONTRACTION_RE.sub("", text)   # "doesn't" -> "doesn", not a fragment candidate
     toks = TOKEN_RE.findall(text)
     low = [t.lower() for t in toks]
@@ -183,13 +183,14 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     if len(window) < MIN_WINDOW_ITEMS:
         return []
 
-    per_item: list[tuple[ItemLike, dict[str, str], set[str]]] = []
+    per_item: list[tuple[ItemLike, dict[str, set[str]], set[str]]] = []
     seen_items: dict[str, set[int]] = {}
     seen_sources: dict[str, set[str]] = {}
     seen_days: dict[str, set[str]] = {}
-    display: dict[str, str] = {}
-    one_token: set[str] = set()   # keys seen at least once as a single token ("codemode")
-    spaced: dict[str, str] = {}   # first multi-word spelling of a key ("code mode")
+    one_token_items: dict[str, set[int]] = {}   # items that write the key as one token ("codemode")
+    spaced_items: dict[str, set[int]] = {}      # items that write it as words ("code mode")
+    spaced: dict[str, set[str]] = {}            # every multi-word spelling ("open ai agents", "openai agents")
+    one_token: dict[str, set[str]] = {}         # every one-token spelling
     for idx, it in enumerate(window):
         grams = _ngrams(_doc_text(it))
         title_keys = set(_ngrams(it.title))
@@ -198,19 +199,31 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
             seen_items.setdefault(key, set()).add(idx)
             seen_sources.setdefault(key, set()).add(it.source)
             seen_days.setdefault(key, set()).add(it.item_id[:10])
-            display.setdefault(key, min(forms, key=lambda f: (" " in f, f)))
             for shown in forms:
                 if " " in shown:
-                    spaced.setdefault(key, shown)
+                    spaced.setdefault(key, set()).add(shown)
+                    spaced_items.setdefault(key, set()).add(idx)
                 else:
-                    one_token.add(key)
+                    one_token.setdefault(key, set()).add(shown)
+                    one_token_items.setdefault(key, set()).add(idx)
 
     # Without a word list every long ordinary word would look coined, so the lane is off.
     use_coined = has_dictionary()
 
     def coined(key: str) -> bool:
-        """A key seen as one token in any item that no dictionary knows, whatever spelling came first."""
-        return use_coined and key in one_token and not is_word(key)
+        """A key written as one token in enough items on its own, that no dictionary knows.
+
+        Counting only the one-token items, not every item with the key, keeps a single
+        "#PromptCaching" from moving the ordinary phrase "prompt caching" into the lane.
+        """
+        return (use_coined and len(one_token_items.get(key, ())) >= MIN_COINED_ITEMS
+                and not is_word(key))
+
+    def display(key: str) -> str:
+        """The spelling most items use: the spaced form wins only as a strict majority."""
+        if len(spaced_items.get(key, ())) > len(one_token_items.get(key, ())):
+            return min(spaced[key])
+        return min(one_token[key])
 
     survivors = {k for k, ix in seen_items.items()
                  if len(seen_days[k]) >= MIN_WINDOW_DAYS
@@ -223,15 +236,20 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     # cheaply no matter how many distinct phrases the window contains.
     # Word-boundary regexes, not collapsed substrings: "code mode" must not match
     # "decode mode", which a collapsed-text search does.
-    # Built from a spaced spelling when one was seen: alias_pattern("code mode") also matches
+    # Built from every spaced spelling seen: alias_pattern("code mode") also matches
     # "codemode" and "code-mode", but alias_pattern("codemode") matches neither spaced form,
-    # so an established "code mode" would read as brand new.
-    pats = {k: alias_pattern(spaced.get(k, display[k])) for k in survivors}
+    # and alias_pattern("openai agents") misses "open ai agents", so any one spelling alone
+    # can make an established term read as brand new.
+    pats = {k: re.compile("|".join(alias_pattern(f).pattern for f in sorted(spaced.get(k) or one_token[k])), re.I)
+            for k in survivors}
     base_count = dict.fromkeys(survivors, 0)
     for it in baseline:
         text = _doc_text(it)
+        # Any match collapses to its key, so a key absent from the collapsed text cannot
+        # match; this skips nearly every regex without changing a single count.
+        flat = collapse(text)
         for key, pat in pats.items():
-            if pat.search(text):
+            if key in flat and pat.search(text):
                 base_count[key] += 1
 
     # The wiki test is deliberately looser than the baseline test: also compare spelling-blind
@@ -242,7 +260,7 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
         if base_count[key] > MAX_BASELINE_ITEMS or pats[key].search(wiki_text) or key in wiki_flat:
             continue
         title_hits = sum(1 for _, _, tk in per_item if key in tk)
-        c = Candidate(display[key], key, len(seen_items[key]), len(seen_sources[key]),
+        c = Candidate(display(key), key, len(seen_items[key]), len(seen_sources[key]),
                       title_hits, base_count[key], len(seen_days[key]))
         c.score = c.sources * 3 + c.items + 2 * c.in_titles
         cands.append(c)
