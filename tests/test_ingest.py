@@ -706,6 +706,16 @@ def test_coinage_does_not_depend_on_which_spelling_comes_first(monkeypatch):
         assert "codemode" in [c.key for c in radar.emerging_terms(window, [], "")]
 
 
+def test_an_established_spaced_term_is_not_new_when_also_written_as_one_token(monkeypatch):
+    """The baseline is searched with the spaced spelling, which also matches the one-token form."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS)
+    window = [arch_item("2026-10-02-aa-01", "a", "code mode and codemode", ""),
+              arch_item("2026-10-03-bb-01", "b", "code mode", ""),
+              arch_item("2026-10-03-cc-01", "c", "code mode", "")]
+    baseline = [arch_item(f"2026-08-0{d}-zz-01", "z", "code mode everywhere", "") for d in range(1, 10)]
+    assert "codemode" not in [c.key for c in radar.emerging_terms(window, baseline, "")]
+
+
 def test_without_a_word_list_single_words_need_phrase_evidence(monkeypatch):
     """No dictionary: an ordinary word in 2 items from 1 source is not a coinage, but 2 sources still count."""
     monkeypatch.setattr(radar, "_DICT_WORDS", set())

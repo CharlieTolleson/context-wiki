@@ -58,14 +58,16 @@ MIN_KEY_LEN = 6
 # A single token that is not an English word is a coinage or a name ("codemode", "langgraph"),
 # which is far more informative than a common phrase, so it needs less evidence.
 MIN_COINED_ITEMS = 2
-MIN_PHRASE_SOURCES = 2   # ordinary phrases need two independent sources; coinages do not
+MIN_PHRASE_SOURCES = 2   # ordinary phrases need two independent sources; coinages do not (with a word list)
 # Words that come from our own item templates and scraped social posts, never from the
 # subject matter. Any candidate containing one is noise.
 BOILERPLATE = frozenset("""points comments matched topic discussion subreddits twitters retweet
 impression count expanded reply replied url ainews http https www com""".split())
 # A concept can be a trend inside ONE source for weeks before a second one picks it up
 # (Latent Space was alone in mentioning "codemode" for a week), so a second source is not
-# required. Precision comes from the baseline test plus the LLM filter in ai_research.
+# required for a coinage. That lane needs a word list (/usr/share/dict/words, present on
+# macOS; on Linux install wamerican): without one, single words get phrase rules.
+# Precision comes from the baseline test plus the LLM filter in ai_research.
 
 
 class ItemLike(Protocol):
@@ -134,12 +136,12 @@ def collapse(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
-def _ngrams(text: str) -> dict[str, str]:
+def _ngrams(text: str) -> dict[str, set[str]]:
     """Candidate phrases in `text` as {key: display}. One to three tokens, no edge stopwords."""
     text = CONTRACTION_RE.sub("", text)   # "doesn't" -> "doesn", not a fragment candidate
     toks = TOKEN_RE.findall(text)
     low = [t.lower() for t in toks]
-    out: dict[str, str] = {}
+    out: dict[str, set[str]] = {}
     n = len(toks)
     for i in range(n):
         for size in (1, 2, 3):
@@ -155,10 +157,7 @@ def _ngrams(text: str) -> dict[str, str]:
             if size == 1 and (len(words[0]) < 5 or is_word(words[0])):
                 continue
             shown = " ".join(words).replace("-", " ")
-            if size == 1:
-                out[key] = shown   # a one-token spelling wins, so coinage is not order-dependent
-            else:
-                out.setdefault(key, shown)
+            out.setdefault(key, set()).add(shown)   # every spelling, so neither order wins
     return out
 
 
@@ -190,17 +189,21 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     seen_days: dict[str, set[str]] = {}
     display: dict[str, str] = {}
     one_token: set[str] = set()   # keys seen at least once as a single token ("codemode")
+    spaced: dict[str, str] = {}   # first multi-word spelling of a key ("code mode")
     for idx, it in enumerate(window):
         grams = _ngrams(_doc_text(it))
         title_keys = set(_ngrams(it.title))
         per_item.append((it, grams, title_keys))
-        for key, shown in grams.items():
+        for key, forms in grams.items():
             seen_items.setdefault(key, set()).add(idx)
             seen_sources.setdefault(key, set()).add(it.source)
             seen_days.setdefault(key, set()).add(it.item_id[:10])
-            display.setdefault(key, shown)
-            if " " not in shown:
-                one_token.add(key)
+            display.setdefault(key, min(forms, key=lambda f: (" " in f, f)))
+            for shown in forms:
+                if " " in shown:
+                    spaced.setdefault(key, shown)
+                else:
+                    one_token.add(key)
 
     # Without a word list every long ordinary word would look coined, so the lane is off.
     use_coined = has_dictionary()
@@ -220,7 +223,10 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     # cheaply no matter how many distinct phrases the window contains.
     # Word-boundary regexes, not collapsed substrings: "code mode" must not match
     # "decode mode", which a collapsed-text search does.
-    pats = {k: alias_pattern(display[k]) for k in survivors}
+    # Built from a spaced spelling when one was seen: alias_pattern("code mode") also matches
+    # "codemode" and "code-mode", but alias_pattern("codemode") matches neither spaced form,
+    # so an established "code mode" would read as brand new.
+    pats = {k: alias_pattern(spaced.get(k, display[k])) for k in survivors}
     base_count = dict.fromkeys(survivors, 0)
     for it in baseline:
         text = _doc_text(it)
