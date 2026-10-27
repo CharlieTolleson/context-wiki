@@ -43,7 +43,7 @@ import ai_research as a  # noqa: E402
 import radar  # noqa: E402
 
 PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT",
-              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH")
+              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "RETRY_PATH")
 
 
 @contextlib.contextmanager
@@ -61,6 +61,7 @@ def sandbox():
     a.GIT_COMMIT = "auto"
     a.DROPPED_PATH = tmp / "ingest" / "dropped_claims.jsonl"
     a.RECALL_PATH = tmp / "ingest" / "RECALL.md"
+    a.RETRY_PATH = tmp / "ingest" / "merge_retry.json"
     a.WATCHLIST_PATH = tmp / "watchlist.txt"      # absent unless a test writes one
     (tmp / "ingest").mkdir()
     try:
@@ -794,9 +795,47 @@ def test_select_for_merge_puts_reoffered_items_ahead_of_new_ones_within_quota():
     now = datetime.now(timezone.utc)
     fresh = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(hours=n), "b")
              for n in range(5)]
-    old = a.Item("hf-daily-papers", "hf", "old", "https://x/old", now - timedelta(days=3), "b", revived=True)
+    old = a.Item("hf-daily-papers", "hf", "old", "https://x/old", now - timedelta(days=3), "b", retry=True)
     picked = a.select_for_merge(fresh + [old])
     assert old in picked and len(picked) == a.SOURCE_QUOTA["hf-daily-papers"]
+
+
+def test_quota_leftovers_reread_from_yesterday_do_not_take_new_slots():
+    """HF re-reads its watermark day: yesterday's unmerged papers are revived, not retried."""
+    now = datetime.now(timezone.utc)
+    with sandbox():
+        old = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(days=1, hours=n), "b")
+               for n in range(10)]
+        a.write_archive(old, "2026-01-01")
+        a.mark_reviewed([i.item_id for i in old[:3]])           # yesterday's quota merged p0..p2
+        again = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(days=1, hours=n), "b")
+                 for n in range(10)]
+        new = [a.Item("hf-daily-papers", "hf", f"q{n}", f"https://x/q{n}", now - timedelta(hours=n), "b")
+               for n in range(5)]
+        a.write_archive(again + new, "2026-01-02")
+        offered = [i for i in again if i.revived] + new
+        assert not any(i.retry for i in offered)
+        assert [i.title for i in a.select_for_merge(offered)] == ["q0", "q1", "q2"]
+
+
+def test_record_merge_failures_retries_then_gives_up():
+    """A failed item is retried first once; after MAX_MERGE_FAILURES it is left for --backfill."""
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with sandbox():
+        bad = a.Item("anthropic-eng", "ae", "bad", "https://www.anthropic.com/engineering/bad", now, "b")
+        good = a.Item("anthropic-eng", "ae", "good", "https://www.anthropic.com/engineering/good", now, "b")
+        a.write_archive([bad, good], "2026-01-01")
+        assert a.record_merge_failures([bad, good], [good]) == set()
+        again = a.Item("anthropic-eng", "ae", "bad", bad.url, now, "b")
+        a.write_archive([again], "2026-01-02")
+        assert again.retry and again.item_id == bad.item_id
+        assert a.record_merge_failures([again], []) == {bad.item_id}
+        assert bad.url in a.finished_urls()                         # no longer refetched
+        third = a.Item("anthropic-eng", "ae", "bad", bad.url, now, "b")
+        a.write_archive([third], "2026-01-03")
+        assert not third.revived                                    # nor re-offered
+        state, new_state = {"anthropic-eng": "OLD"}, {"anthropic-eng": "NOW"}
+        assert a.hold_watermarks(state, new_state, [again], [], {bad.item_id}) == []
 
 def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
     """Items go to the model MERGE_CHUNK at a time; a rejected chunk is skipped, the rest still land."""
