@@ -676,6 +676,104 @@ def test_http_get_refuses_before_any_request_and_caps_the_body():
         a.urllib.request.build_opener, a.MAX_FETCH_BYTES = real_build, real_cap
 
 
+@contextlib.contextmanager
+def local_server(handler_body):
+    """A one-thread HTTP server on 127.0.0.1 whose GET runs handler_body(handler)."""
+    import http.server
+    import threading
+
+    class H(http.server.BaseHTTPRequestHandler):
+        hits = 0
+
+        def do_GET(self):
+            H.hits += 1
+            handler_body(self)
+
+        def log_message(self, *args):
+            pass
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield srv.server_address[1], H
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def _no_proxy(monkeypatch):
+    for name in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_http_get_refuses_a_host_that_rebinds_to_loopback_at_connect_time(monkeypatch):
+    """check_url sees a public address, the connect-time lookup sees 127.0.0.1: refused, no request."""
+    _no_proxy(monkeypatch)
+    real = a.socket.getaddrinfo
+    answers = iter(["93.184.216.34"])
+
+    def rebinding(host, port, *args, **kw):
+        if host == "rebind.example":
+            ip = next(answers, "127.0.0.1")
+            return [(a.socket.AF_INET, a.socket.SOCK_STREAM, 6, "", (ip, port))]
+        return real(host, port, *args, **kw)
+
+    def ok(h):
+        h.send_response(200); h.end_headers(); h.wfile.write(b"secret")
+    with local_server(ok) as (port, handler):
+        monkeypatch.setattr(a.socket, "getaddrinfo", rebinding)
+        try:
+            a.http_get(f"http://rebind.example:{port}/", allow_private=False)
+            raise AssertionError("expected a refusal")
+        except a.urllib.error.URLError as exc:
+            assert "non-public" in str(exc)
+        assert handler.hits == 0
+
+
+def test_http_get_bounds_a_trickled_body_by_wall_clock(monkeypatch):
+    """A server sending a byte at a time cannot outlast FETCH_DEADLINE, whatever HTTP_TIMEOUT is."""
+    import time
+    _no_proxy(monkeypatch)
+
+    def trickle(h):
+        h.send_response(200); h.send_header("Content-Length", "100"); h.end_headers()
+        for _ in range(100):
+            h.wfile.write(b"x"); h.wfile.flush(); time.sleep(0.05)
+    monkeypatch.setattr(a, "FETCH_DEADLINE", 0.3)
+    with local_server(trickle) as (port, _):
+        started = time.monotonic()
+        try:
+            a.http_get(f"http://127.0.0.1:{port}/")
+            raise AssertionError("expected a deadline error")
+        except a.urllib.error.URLError as exc:
+            assert "not complete" in str(exc)
+        assert time.monotonic() - started < 3
+
+
+def test_http_get_wraps_read_errors_and_refuses_unwanted_types(monkeypatch):
+    """A body cut short is a URLError (callers skip one fetch), and a PDF is refused for prose fetches."""
+    _no_proxy(monkeypatch)
+
+    def short(h):
+        h.send_response(200); h.send_header("Content-Length", "1000"); h.end_headers(); h.wfile.write(b"abc")
+
+    def pdf(h):
+        h.send_response(200); h.send_header("Content-Type", "application/pdf"); h.end_headers()
+        h.wfile.write(b"%PDF-1.7 binary")
+    with local_server(short) as (port, _):
+        try:
+            a.http_get(f"http://127.0.0.1:{port}/")
+            raise AssertionError("expected URLError")
+        except a.urllib.error.URLError:
+            pass
+    with local_server(pdf) as (port, _):
+        assert a.http_get(f"http://127.0.0.1:{port}/").startswith(b"%PDF")
+        try:
+            a.http_get(f"http://127.0.0.1:{port}/", accept_types=a.HTML_TYPES)
+            raise AssertionError("expected a content-type refusal")
+        except a.urllib.error.URLError as exc:
+            assert "application/pdf" in str(exc)
+
+
 def test_add_url_refusal_is_a_clean_error_and_archives_nothing():
     """--add-url file://... returns exit code 1 and writes no archive file."""
     with sandbox():
@@ -913,7 +1011,7 @@ def test_enrich_replaces_thin_bodies_and_ignores_failures():
 
     seen_private: list[bool] = []
 
-    def fake(url, allow_private=True):
+    def fake(url, allow_private=True, accept_types=None):
         seen_private.append(allow_private)
         if "boom" in url:
             raise OSError("down")

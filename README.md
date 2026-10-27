@@ -76,7 +76,7 @@ The first run looks back 14 days (`LOOKBACK_CAP_DAYS`) and writes `INDEX.md`, `a
 | `--since YYYY-MM-DD` | Override every source's watermark (manual backfill of fetching) |
 | `--backfill` | Merge already-archived items that never reached the wiki, in batches (capped at 8 passes) |
 | `--backfill --since YYYY-MM-DD` | Same, limited to archive items from that run date onward |
-| `--add-url URL [--source NAME]` | Fetch one page by hand and run it through the same archive and merge path. Only public `http`/`https` URLs are accepted: `file://` and hosts that resolve to loopback, private, or link-local addresses are refused |
+| `--add-url URL [--source NAME]` | Fetch one page by hand and run it through the same archive and merge path. Only public `http`/`https` URLs are accepted: `file://` and hosts that resolve to loopback, private, or link-local addresses are refused, checked again at connect time so a host cannot rebind its DNS between the check and the request. Only HTML or plain-text pages are fetched |
 | `--add-note TEXT --title TITLE [--source NAME]` | Store a finding that has no URL (something you learned yourself) |
 | `--radar` | Print the coverage report (watchlist gaps, emerging terms, recent removals) and write `RECALL.md` |
 | `--prune` | Bring an over-cap wiki back under the word cap by model-selected deletion |
