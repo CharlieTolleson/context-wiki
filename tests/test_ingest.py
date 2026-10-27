@@ -149,6 +149,43 @@ def test_merge_checked_accepts_retries_and_rejects():
         a.merge_index = real
 
 
+def _merge_reply(content: str, finish_reason: str = "stop") -> str:
+    """Run merge_index against a fake OpenAI client that serves one reply."""
+    import openai
+
+    class FakeClient:
+        def __init__(self, **kw):
+            self.chat = type("C", (), {"completions": self})()
+
+        def create(self, **kw):
+            msg = type("M", (), {"content": content})()
+            choice = type("Ch", (), {"message": msg, "finish_reason": finish_reason})()
+            return type("R", (), {"choices": [choice], "model": "fake"})()
+    real = openai.OpenAI
+    openai.OpenAI = FakeClient
+    try:
+        return a.merge_index("## S\n\n- old [2026-01-01-ab-01]\n", [], {"base_url": "x", "api_key": "y"})
+    finally:
+        openai.OpenAI = real
+
+
+def test_merge_index_discards_a_reply_cut_at_max_tokens():
+    """A truncated reply could pass the shrink guard, so it comes back empty (chunk failed)."""
+    wiki = doc(47)
+    assert _merge_reply(wiki, finish_reason="length") == ""
+    assert _merge_reply(wiki) == wiki.strip()
+
+
+def test_merge_index_unwraps_a_fenced_reply_and_drops_trailing_prose():
+    """Prose around a fenced wiki is not stored; code blocks and inline code inside it survive."""
+    wiki = ("## S\n\n- Call `tool()` once [2026-01-01-ab-01]\n\n```python\nx = 1\n```\n\n"
+            "- Second claim [2026-01-01-ab-02]")
+    assert _merge_reply(f"```markdown\n{wiki}\n```\n\nLet me know if you want changes.") == wiki
+    assert _merge_reply(f"Here is the wiki:\n```markdown\n{wiki}\n```\nDone.") == wiki
+    assert _merge_reply(f"```\n{wiki}\n```") == wiki
+    assert _merge_reply(wiki) == wiki                 # unfenced reply: code block untouched
+
+
 # ── merge prompt: untrusted item block ──────────────────────────────────────
 
 

@@ -1449,8 +1449,25 @@ def merge_index(index_md: str, items: list[Item], creds: dict[str, str],
         ],
     )
     log(f"merge served by: {resp.model}")
+    # A reply cut at max_tokens has lost its tail sections. If that is under a quarter of the
+    # claims the shrink guard would accept it, so a truncated wiki is never returned: "" makes
+    # merge_checked/merge_chunked treat the chunk as failed and its items stay archived.
+    if resp.choices[0].finish_reason == "length":
+        log("WARN merge reply hit max_tokens (finish_reason=length); discarding it")
+        return ""
     out = (resp.choices[0].message.content or "").strip()
-    out = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", out)  # strip stray fences
+    # Models sometimes wrap the wiki in a fence and add prose after it ("Let me know if...").
+    # Stripping a fence only at the very ends stored that chatter in the wiki, so unwrap from
+    # the opening fence to the LAST closing fence line. Going to the last one keeps a code
+    # block inside the wiki intact; only line-anchored ``` count, so inline `code` is untouched.
+    opening = (re.match(r"```(?:markdown|md)?[ \t]*\n", out)
+               or re.search(r"^```(?:markdown|md)[ \t]*\n", out, re.M))
+    if opening:
+        body = out[opening.end():]
+        closes = list(re.finditer(r"^[ \t]*```[ \t]*$", body, re.M))
+        out = body[:closes[-1].start()] if closes else body
+    else:
+        out = re.sub(r"^```(?:markdown)?\s*|\s*```$", "", out)  # strip stray fences
     return out.strip()
 
 
