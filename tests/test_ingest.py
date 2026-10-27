@@ -43,7 +43,7 @@ import ai_research as a  # noqa: E402
 import radar  # noqa: E402
 
 PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT",
-              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH")
+              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "LOCK_PATH")
 
 
 @contextlib.contextmanager
@@ -62,6 +62,7 @@ def sandbox():
     a.DROPPED_PATH = tmp / "ingest" / "dropped_claims.jsonl"
     a.RECALL_PATH = tmp / "ingest" / "RECALL.md"
     a.WATCHLIST_PATH = tmp / "watchlist.txt"      # absent unless a test writes one
+    a.LOCK_PATH = tmp / "ingest" / "run.lock"
     (tmp / "ingest").mkdir()
     try:
         yield tmp
@@ -243,6 +244,59 @@ def test_write_archive_dedupes_within_a_batch_and_reoffers_unmerged():
         assert C3.item_id == "2026-10-02-ls-01"                    # new: archived
         ids = [i.item_id for i in a.read_archive()]
         assert len(ids) == len(set(ids)) == 4                      # no second copy of anything
+
+
+def test_atomic_write_keeps_the_old_file_when_the_write_fails_partway():
+    """A failure after some bytes are written leaves the old file whole and no temp file behind."""
+    with sandbox() as tmp:
+        target = tmp / "INDEX.md"
+        target.write_text("old wiki\n")
+        real = os.fsync
+
+        def disk_full(fd):
+            raise OSError(28, "No space left on device")
+
+        os.fsync = disk_full
+        try:
+            a.atomic_write(target, "new wiki that never fully lands\n")
+            raise AssertionError("the failed write did not raise")
+        except OSError:
+            pass
+        finally:
+            os.fsync = real
+        assert target.read_text() == "old wiki\n"
+        assert sorted(p.name for p in tmp.iterdir()) == ["INDEX.md", "ingest"]
+        a.atomic_write(tmp / "state" / "state.json", "{}\n")     # a missing parent dir is created
+        assert (tmp / "state" / "state.json").read_text() == "{}\n"
+
+
+def _lock_is_free() -> bool:
+    """Try the run lock from a separate descriptor, as a second process would."""
+    import fcntl
+    fd = os.open(a.LOCK_PATH, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_writing_modes_hold_the_run_lock_and_release_it_after():
+    """--add-url runs under the lock (a second run would have to wait); it is freed afterwards."""
+    with sandbox():
+        seen = []
+        saved = a.add_manual, a.load_env, sys.argv
+        a.add_manual = lambda *args: seen.append(_lock_is_free()) or 0
+        a.load_env = lambda: {}
+        sys.argv = ["ai_research.py", "--add-url", "https://example.com/post"]
+        try:
+            assert a.main() == 0
+        finally:
+            a.add_manual, a.load_env, sys.argv = saved
+        assert seen == [False]                                      # held while the mode ran
+        assert _lock_is_free()                                      # released when it returned
 
 
 # ── git commit scoping ──────────────────────────────────────────────────────
