@@ -1677,6 +1677,8 @@ def prune_to_cap(index_md: str, creds: dict[str, str]) -> str:
     So the model sees the numbered claims and returns only the numbers to delete, and this code
     does the deleting. Every surviving claim is byte-for-byte untouched, and the watchlist
     rule is enforced here: the last claim covering a watchlist concept is never deleted.
+    Picks are applied in the model's order and only until the word target is met, and never
+    below claim_floor of the starting wiki, so an over-eager reply cannot empty the wiki.
 
     Args:
         index_md: Current wiki text.
@@ -1718,26 +1720,46 @@ def prune_to_cap(index_md: str, creds: dict[str, str]) -> str:
             found = re.search(r"\[[\d,\s]*\]", resp.choices[0].message.content or "")
             if not found:
                 raise ValueError("no JSON array in the reply")
-            picks = {k for k in json.loads(found.group(0)) if isinstance(k, int) and 0 <= k < len(claim_ix)}
+            # Keep the model's order (dict.fromkeys dedupes without reordering): the prompt gives
+            # it a deletion order, and deletion below stops once the target is met.
+            order = list(dict.fromkeys(
+                k for k in json.loads(found.group(0)) if isinstance(k, int) and 0 <= k < len(claim_ix)))
         except Exception as exc:
             log(f"WARN prune pass {n} failed: {type(exc).__name__}: {str(exc)[:120]}")
             return current
 
         # Protect the sole remaining claim for each watchlist concept.
+        picks = set(order)
         protected = set()
         for entry in watch:
             carriers = [k for k, i in enumerate(claim_ix) if radar.covered(lines[i], entry)]
             if len(carriers) >= 1 and all(k in picks for k in carriers):
                 protected.add(carriers[0])
-        picks -= protected
-        if not picks:
-            log(f"WARN prune pass {n} selected nothing deletable; stopping")
+        # Delete only as many picks as the target needs, and never below the shrink-guard floor
+        # of the wiki the prune started from. Without these bounds a reply listing every number
+        # (a bad reply, or one steered by text in a claim) wiped all but the protected claims,
+        # and the result was written: merge_checked's guard never sees prune output (audit
+        # 2026-10-23).
+        floor = claim_floor(index_md)
+        remaining_words, remaining_claims = words, len(claim_ix)
+        drop: set[int] = set()
+        for k in order:
+            if remaining_words <= target or remaining_claims - 1 < floor:
+                break
+            if k in protected:
+                continue
+            drop.add(claim_ix[k])
+            remaining_words -= len(lines[claim_ix[k]].split())
+            remaining_claims -= 1
+        if not drop:
+            log(f"WARN prune pass {n} selected nothing deletable (floor {floor}); stopping")
             return current
-        drop = {claim_ix[k] for k in picks}
+        prev = current
         current = "\n".join(ln for i, ln in enumerate(lines) if i not in drop) + "\n"
-        record_dropped(index_md, current)
-        log(f"  deleted {len(picks)} claims ({len(protected)} spared as sole watchlist coverage) "
-            f"-> {len(current.split())} words")
+        # Log against this pass's input, so a claim deleted in pass 1 is not logged again in pass 2.
+        record_dropped(prev, current)
+        log(f"  deleted {len(drop)} of {len(order)} picked claims ({len(protected)} spared as sole "
+            f"watchlist coverage, floor {floor}) -> {len(current.split())} words")
     return current
 
 
