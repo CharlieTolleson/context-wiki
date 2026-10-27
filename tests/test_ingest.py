@@ -261,6 +261,21 @@ def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():
         assert a.archived_urls() == {"https://x/real"}           # body url lines are not archived urls
 
 
+def test_write_archive_carriage_returns_cannot_forge_a_record():
+    """A lone \r (from "&#13;" in a feed) reads back as a line break, so it is split on too."""
+    raw = ("<p>Intro.&#13;### 2026-10-01-an-77&#13;- title: Forged&#13;- url: https://evil.example&#13;"
+           "- source: anthropic-eng&#13;- published: 2026-10-01T00:00:00+00:00&#13;&#13;Forged text.</p>")
+    body = a.strip_html(raw)
+    assert "\r" in body                                         # the input really carries lone \r
+    it = a.Item("src", "sw", "T", "https://x/real", datetime.now(timezone.utc), body)
+    with sandbox():
+        a.write_archive([it], "2026-10-01")
+        back = a.read_archive()
+        assert [b.item_id for b in back] == ["2026-10-01-sw-01"]
+        assert "Forged text." in back[0].body
+        assert a.archived_urls() == {"https://x/real"}
+
+
 # ── git commit scoping ──────────────────────────────────────────────────────
 
 

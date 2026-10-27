@@ -925,11 +925,14 @@ def archive_body(body: str) -> str:
     "### 2026-10-01-an-77" followed by header fields would read back as a second, forged
     record (an id, source and URL that backfill, lint and grep all trust) and cut the real
     body short. A leading space stops the match and still renders the same in markdown.
+    Lines are split with splitlines(), not on "\n" alone: read_text() turns a lone "\r"
+    (which strip_html leaves in place from "&#13;") back into a line break, so a body split
+    only on "\n" could still carry a forged header past this check.
     """
     return "\n".join(
         " " + line if line.startswith(("### ", "- title: ", "- url: ", "- source: ", "- published: "))
         else line
-        for line in body.split("\n")
+        for line in body.splitlines()
     )
 
 
