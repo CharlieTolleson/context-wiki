@@ -111,10 +111,11 @@ STATE_PATH = STATE_DIR / "state.json"
 # Item ids backfill has already shown the merge model (cited or deliberately dropped).
 # Without this, dropped items look "pending" forever and get re-picked every pass.
 REVIEWED_PATH = STATE_DIR / "backfill_reviewed.json"
-# Item ids whose merge chunk failed: how often each failed, and those given up on (left to
-# --backfill). Only these items jump the per-source queue; see record_merge_failures.
+# Item ids whose merge chunk failed: how often each failed alone, and those given up on (left
+# to --backfill). Only these items jump the per-source queue; see record_merge_failures.
 RETRY_PATH = STATE_DIR / "merge_retry.json"
-MAX_MERGE_FAILURES = 2
+MAX_MERGE_FAILURES = 2   # failures in a chunk of its own before an item is given up on
+MAX_SOLO_MERGES = 4      # earlier failures merged one per call in a run; see plan_chunks
 DROPPED_PATH = STATE_DIR / "dropped_claims.jsonl"   # every claim a merge removed, for the recall report
 RECALL_PATH = STATE_DIR / "RECALL.md"               # latest coverage report (local, regenerated each run)
 # Optional separate file for the endpoint credentials, so secrets can live in one shared place.
@@ -257,7 +258,7 @@ class Item:
     body: str
     item_id: str = ""
     revived: bool = False   # archived by an earlier run that never merged it (write_archive)
-    retry: bool = False     # and its merge chunk failed then, so it goes ahead of new items
+    retry: bool = False     # and its merge chunk failed then, so it goes first (plan_chunks)
 
 
 def log(msg: str) -> None:
@@ -1629,6 +1630,27 @@ def merge_checked(index_md: str, items: list[Item], creds: dict[str, str], hint:
     )
 
 
+def plan_chunks(items: list[Item]) -> list[list[Item]]:
+    """Split a merge batch into chunks: earlier failures alone first, then MERGE_CHUNK at a time.
+
+    The guards reject a whole chunk, so a failed chunk only says that one of its items is
+    bad. An item whose chunk failed in an earlier run (retry) goes in a chunk of its own, and
+    record_merge_failures counts a strike only for an item that failed alone, so the
+    chunk-mates of a poisoned item are not given up with it. Bisecting a failed chunk in the
+    same run would find the item sooner but costs about eight calls per bad item; this costs
+    one call per isolated item, in the runs after a failure only. At most MAX_SOLO_MERGES
+    items go alone (oldest first, so none waits forever behind newer ones), so a run makes at
+    most that many extra calls where one failed chunk would otherwise mean fifteen; the rest
+    share chunks as usual and stay pending until a later run isolates them.
+
+    Deterministic, so record_merge_failures rebuilds exactly the chunks merge_chunked sent.
+    """
+    solo = sorted((i for i in items if i.retry), key=lambda i: i.published)[:MAX_SOLO_MERGES]
+    alone = {id(i) for i in solo}
+    rest = [i for i in items if id(i) not in alone]
+    return [[i] for i in solo] + [rest[k:k + MERGE_CHUNK] for k in range(0, len(rest), MERGE_CHUNK)]
+
+
 def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
                   hint: str = "") -> tuple[str, list[Item]]:
     """Merge `items` into the wiki MERGE_CHUNK at a time, each chunk against the previous result.
@@ -1637,7 +1659,9 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
     guards) or, once corrected, returns the old wiki unchanged. Small chunks keep every call
     inside the range where it reliably integrates new items. A chunk the guards reject is
     skipped and its items reported as unmerged; the other chunks still land, and main()
-    holds the watermarks of the unmerged items' sources (hold_watermarks).
+    holds the watermarks of the unmerged items' sources (hold_watermarks). Up to
+    MAX_SOLO_MERGES items whose chunk failed in an earlier run go first, one per chunk
+    (plan_chunks).
 
     Args:
         index_md: Current wiki text.
@@ -1652,7 +1676,7 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         MergeRejected: Every chunk failed, so nothing was merged.
     """
     current, merged, failures = index_md, [], 0
-    chunks = [items[i:i + MERGE_CHUNK] for i in range(0, len(items), MERGE_CHUNK)]
+    chunks = plan_chunks(items)
     for n, chunk in enumerate(chunks, start=1):
         try:
             out = merge_checked(current, chunk, creds, hint=hint)
@@ -1676,13 +1700,22 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
 
 
 def load_retry() -> dict:
-    """The merge-failure ledger: {"pending": {item_id: failures}, "gave_up": [item_id, ...]}."""
+    """The merge-failure ledger: {"pending": {item_id: failures}, "gave_up": [item_id, ...]}.
+
+    A file of the wrong shape (a list, null, a non-integer count) is treated like an
+    unreadable one: every caller indexes into it, so a hand edit must not crash the run.
+    """
     try:
         data = json.loads(RETRY_PATH.read_text()) if RETRY_PATH.exists() else {}
-    except (json.JSONDecodeError, OSError):
+        pending, gave_up = data.get("pending", {}), data.get("gave_up", [])
+        if not (isinstance(pending, dict) and isinstance(gave_up, list)
+                and all(isinstance(k, str) and type(v) is int for k, v in pending.items())
+                and all(isinstance(k, str) for k in gave_up)):
+            raise ValueError("wrong shape")
+    except (json.JSONDecodeError, OSError, AttributeError, ValueError):
         log("WARN merge_retry.json unreadable; ignoring it")
-        data = {}
-    return {"pending": dict(data.get("pending", {})), "gave_up": list(data.get("gave_up", []))}
+        pending, gave_up = {}, []
+    return {"pending": dict(pending), "gave_up": list(gave_up)}
 
 
 def record_merge_failures(offered: list[Item], merged: list[Item]) -> set[str]:
@@ -1694,6 +1727,10 @@ def record_merge_failures(offered: list[Item], merged: list[Item]) -> set[str]:
     has no lookback window. A given-up item is no longer re-offered or refetched; it stays
     archived and unreviewed, so --backfill can still take it.
 
+    Only a failure in a chunk of one counts. Items of a failed shared chunk are recorded
+    with no strike, which makes the next run merge each alone (plan_chunks); counting them
+    gave up the innocent neighbours of a bad item after two shared failures.
+
     Returns:
         Ids given up on in this run, whose sources need no watermark hold for them.
     """
@@ -1702,14 +1739,18 @@ def record_merge_failures(offered: list[Item], merged: list[Item]) -> set[str]:
     for item_id in merged_now:
         retry["pending"].pop(item_id, None)
     gave_up: set[str] = set()
-    for i in offered:
-        if i.item_id in merged_now:
-            continue
-        n = retry["pending"].pop(i.item_id, 0) + 1
-        if n >= MAX_MERGE_FAILURES:
-            gave_up.add(i.item_id)
-        else:
-            retry["pending"][i.item_id] = n
+    for chunk in plan_chunks(offered):
+        for i in chunk:
+            if i.item_id in merged_now:
+                continue
+            if len(chunk) > 1:
+                retry["pending"].setdefault(i.item_id, 0)
+                continue
+            n = retry["pending"].pop(i.item_id, 0) + 1
+            if n >= MAX_MERGE_FAILURES:
+                gave_up.add(i.item_id)
+            else:
+                retry["pending"][i.item_id] = n
     if gave_up:
         log(f"WARN giving up on {len(gave_up)} item(s) after {MAX_MERGE_FAILURES} failed merges "
             f"(left for --backfill): {', '.join(sorted(gave_up))[:200]}")
@@ -2465,6 +2506,10 @@ def main() -> int:
     except Exception as exc:
         log(f"ERROR merge failed: {type(exc).__name__}: {str(exc)[:200]}")
         log("archive was written; watermarks NOT advanced so the next run retries these items")
+        # Every chunk failed: record that too, or an item that fails alone is never given
+        # up on and fails the job every day.
+        if isinstance(exc, MergeRejected):
+            record_merge_failures(merge_items, [])
         return 1
 
     if not updated:
@@ -2475,7 +2520,7 @@ def main() -> int:
                            record_merge_failures(merge_items, merged_items))
     if held:
         log(f"WARN watermark held for {', '.join(held)}: a merge chunk with their items failed, "
-            "so the next run refetches them and write_archive re-offers them ahead of new items")
+            f"so the next run refetches them and merges up to {MAX_SOLO_MERGES} of them alone first")
 
     updated = prune_to_cap(updated, creds)
     write_wiki(updated)
