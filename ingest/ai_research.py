@@ -1492,9 +1492,9 @@ class MergeRejected(Exception):
 # A horizontal rule or setext underline ("---", "* * *", "===").
 _RULE = re.compile(r"\s*([-*_=])(?:\s*\1){2,}\s*$")
 # A line that starts its own Markdown block, so it is never joined onto the bullet above:
-# a list item of any marker, an ATX heading, a quote, a table row, an HTML block or comment.
-# "#1 on SWE-bench" is not a heading and does join.
-_OWN_BLOCK = re.compile(r"\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}(?:\s|$)|[<|>])")
+# a list item of any marker, an ATX heading, a quote, a table row, an HTML tag or comment.
+# "#1 on SWE-bench" is not a heading and "<5ms" is not a tag, so both join.
+_OWN_BLOCK = re.compile(r"\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}(?:\s|$)|<[A-Za-z/!?]|[|>])")
 # A code fence opener: three or more backticks or tildes, and no backtick after them, so a
 # line that starts with inline ```code``` is not a fence.
 _FENCE = re.compile(r"\s*(`{3,}|~{3,})[^`]*$")
