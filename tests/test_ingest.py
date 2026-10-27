@@ -860,6 +860,29 @@ def _prune_with(wiki: str, replies: list) -> str:
         openai.OpenAI = real
 
 
+def test_unwrap_claims_joins_continuations_but_not_code_or_sub_bullets():
+    """A wrapped claim becomes one line; fences, sub-bullets and headings are left alone."""
+    md = ("## S\n\n- Let agents write code against MCP servers,\n  which is code mode [2026-01-01-cf-01]\n"
+          "- Example:\n```python\nx = 1\n```\n  - a sub-bullet\n\n## T\n")
+    out = a.unwrap_claims(md)
+    assert "- Let agents write code against MCP servers, which is code mode [2026-01-01-cf-01]" in out
+    assert "```python\nx = 1\n```" in out and "  - a sub-bullet" in out and out.endswith("## T\n")
+    assert a.unwrap_claims(out) == out
+
+
+def test_prune_deletes_a_wrapped_claim_whole_and_protects_its_second_line():
+    """A claim wrapped over two lines is deleted whole, and a watchlist term on its second line counts."""
+    with sandbox():
+        a.WATCHLIST_PATH.write_text("code mode\n")
+        filler = " ".join(["word"] * 60)
+        lines = [f"- {filler} number {n} [2026-01-01-ab-{n:02d}]" for n in range(40)]
+        lines[0] = f"- {filler} wrapped first,\n  second line [2026-01-01-ab-00]"
+        lines[1] = f"- {filler} also wrapped,\n  and this is code mode [2026-01-01-zz-01]"
+        out = _prune_with("## S\n\n" + "\n".join(lines) + "\n", [str(list(range(0, 20)))])
+        assert "second line" not in out and "2026-01-01-ab-00" not in out    # no orphaned tail
+        assert "code mode" in out                                           # sole carrier spared
+
+
 def test_prune_reply_naming_every_claim_stops_at_target_and_floor():
     """A reply listing every claim number deletes only down to the word target, never below the floor."""
     with sandbox():
