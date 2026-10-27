@@ -679,8 +679,13 @@ def arch_item(item_id: str, source: str, title: str, body: str) -> a.Item:
     return a.Item(source, item_id.split("-")[3], title, "", datetime.now(timezone.utc), body, item_id)
 
 
-def test_a_coinage_in_two_items_on_two_days_is_an_emerging_term():
+# A small pinned word list, so coinage tests do not depend on /usr/share/dict (absent on Linux CI).
+RADAR_WORDS = {"code", "mode", "again", "here", "filler", "announce", "introduce", "ship", "support"}
+
+
+def test_a_coinage_in_two_items_on_two_days_is_an_emerging_term(monkeypatch):
     """A non-dictionary token seen in 2 items on 2 days, absent from the baseline and the wiki, is reported."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS)
     window = [arch_item("2026-10-02-ls-01", "latent-space", "Pi 1.0", "ships with Codemode support"),
               arch_item("2026-10-03-nw-01", "news", "Roundup", "the model really loves codemode"),
               arch_item("2026-10-03-nw-02", "news", "Other", "nothing relevant here")]
@@ -689,6 +694,27 @@ def test_a_coinage_in_two_items_on_two_days_is_an_emerging_term():
     assert "codemode" in [c.key for c in found]
     covered_wiki = "## Wiki\n\n- Use Code Mode to let agents write code. [2026-01-01-ab-01]\n"
     assert "codemode" not in [c.key for c in radar.emerging_terms(window, baseline, covered_wiki)]
+
+
+def test_coinage_does_not_depend_on_which_spelling_comes_first(monkeypatch):
+    """'codemode' then 'code mode' and the reverse order both report the coinage."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS)
+    one = arch_item("2026-10-02-ls-01", "latent-space", "codemode is here", "")
+    two = arch_item("2026-10-03-ls-01", "latent-space", "code mode again", "")
+    filler = arch_item("2026-10-03-nw-01", "news", "filler", "")
+    for window in ([one, two, filler], [two, one, filler]):
+        assert "codemode" in [c.key for c in radar.emerging_terms(window, [], "")]
+
+
+def test_without_a_word_list_single_words_need_phrase_evidence(monkeypatch):
+    """No dictionary: an ordinary word in 2 items from 1 source is not a coinage, but 2 sources still count."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", set())
+    window = [arch_item("2026-10-02-ab-01", "one", "announcing things", ""),
+              arch_item("2026-10-03-ab-01", "one", "announcing more", ""),
+              arch_item("2026-10-03-cd-01", "two", "unrelated", "")]
+    assert "announcing" not in [c.key for c in radar.emerging_terms(window, [], "")]
+    window[2] = arch_item("2026-10-03-cd-01", "two", "announcing again", "")
+    assert "announcing" in [c.key for c in radar.emerging_terms(window, [], "")]
 
 
 def test_an_ordinary_phrase_needs_two_independent_sources():
@@ -700,12 +726,16 @@ def test_an_ordinary_phrase_needs_two_independent_sources():
     assert has(two)
 
 
-def test_a_term_common_in_the_older_archive_is_not_new():
+def test_a_term_common_in_the_older_archive_is_not_new(monkeypatch):
     """The baseline test rejects vocabulary the archive already uses a lot."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS)
     window = [arch_item("2026-10-02-ls-01", "a", "t", "shipping codemode"),
-              arch_item("2026-10-03-nw-01", "b", "t", "also codemode")]
+              arch_item("2026-10-03-nw-01", "b", "t", "also codemode"),
+              arch_item("2026-10-03-nw-02", "b", "t", "filler")]
+    keys = lambda base: [c.key for c in radar.emerging_terms(window, base, "")]
+    assert "codemode" in keys([])
     baseline = [arch_item(f"2026-08-0{n}-ab-01", "x", "t", "codemode everywhere") for n in range(1, 6)]
-    assert not radar.emerging_terms(window, baseline, "")
+    assert "codemode" not in keys(baseline)
 
 
 def test_watchlist_matches_any_spelling_and_detects_regressions():

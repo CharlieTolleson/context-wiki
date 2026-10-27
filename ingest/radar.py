@@ -16,9 +16,12 @@ has no paths, network, or LLM dependency. ai_research.py owns the I/O: it feeds 
 items in, runs targeted searches for what comes out, and passes a hint to the merge.
 
 Key design decisions:
-  * No dictionary or NLP library. "New" is defined against the archive itself: a term that
-    the older archive barely contains but the last few weeks contain often is new to us,
-    whatever it is. Common English words fail the baseline test automatically.
+  * No NLP library. "New" is defined against the archive itself: a term that the older
+    archive barely contains but the last few weeks contain often is new to us, whatever it
+    is. The one outside resource is the system word list (/usr/share/dict), used to tell a
+    coined single word ("codemode") from an ordinary one ("announcing"). Coinages need less
+    evidence than phrases; without the word list there is no coinage lane, and single words
+    must meet the phrase rules (more items, two sources).
   * Keys ignore case, spaces, and hyphens, so "code mode", "Code-Mode", and "codemode"
     are one term.
   * Candidates are ranked by how many distinct SOURCES carry them, not raw count, because
@@ -93,7 +96,7 @@ def _dictionary() -> set[str]:
     """Lowercase English words from the system word list, or an empty set if there is none.
 
     Used only to reject a single ordinary word ("announcing") posing as a coined term. It is
-    optional: without the file, single words are filtered by the baseline test and the LLM.
+    optional: without the file, has_dictionary() is False and the coinage lane is off.
     """
     global _DICT_WORDS
     if _DICT_WORDS is None:
@@ -106,6 +109,11 @@ def _dictionary() -> set[str]:
             except OSError:
                 continue
     return _DICT_WORDS
+
+
+def has_dictionary() -> bool:
+    """True if a system word list was found, so coinages can be told from ordinary words."""
+    return bool(_dictionary())
 
 
 def is_word(w: str) -> bool:
@@ -146,7 +154,11 @@ def _ngrams(text: str) -> dict[str, str]:
                 continue
             if size == 1 and (len(words[0]) < 5 or is_word(words[0])):
                 continue
-            out.setdefault(key, " ".join(words).replace("-", " "))
+            shown = " ".join(words).replace("-", " ")
+            if size == 1:
+                out[key] = shown   # a one-token spelling wins, so coinage is not order-dependent
+            else:
+                out.setdefault(key, shown)
     return out
 
 
@@ -177,6 +189,7 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     seen_sources: dict[str, set[str]] = {}
     seen_days: dict[str, set[str]] = {}
     display: dict[str, str] = {}
+    one_token: set[str] = set()   # keys seen at least once as a single token ("codemode")
     for idx, it in enumerate(window):
         grams = _ngrams(_doc_text(it))
         title_keys = set(_ngrams(it.title))
@@ -186,10 +199,15 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
             seen_sources.setdefault(key, set()).add(it.source)
             seen_days.setdefault(key, set()).add(it.item_id[:10])
             display.setdefault(key, shown)
+            if " " not in shown:
+                one_token.add(key)
+
+    # Without a word list every long ordinary word would look coined, so the lane is off.
+    use_coined = has_dictionary()
 
     def coined(key: str) -> bool:
-        """A one-token candidate that no dictionary knows."""
-        return " " not in display[key] and not is_word(key)
+        """A key seen as one token in any item that no dictionary knows, whatever spelling came first."""
+        return use_coined and key in one_token and not is_word(key)
 
     survivors = {k for k, ix in seen_items.items()
                  if len(seen_days[k]) >= MIN_WINDOW_DAYS
