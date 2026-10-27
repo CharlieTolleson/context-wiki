@@ -636,13 +636,17 @@ def index_card_dates(index_html: str) -> dict[str, datetime]:
     return dates
 
 
+# The url line of a real record header: it sits directly under the `### id` and `- title:`
+# lines. Matching any line that starts with "- url: " let a feed body name a URL (say, an
+# article that has not been fetched yet) and so have that article skipped as a duplicate.
+ARCHIVE_URL_RE = re.compile(r"^### \S+\n- title: [^\n]*\n- url: ([^\n]*)$", re.M)
+
+
 def archived_urls() -> set[str]:
-    """Every URL already recorded in the archive, for sources with no dates."""
+    """Every URL already recorded in an archive record header, for sources with no dates."""
     urls: set[str] = set()
     for path in ARCHIVE_DIR.glob("*.md"):
-        for line in path.read_text().splitlines():
-            if line.startswith("- url: "):
-                urls.add(line[7:].strip())
+        urls.update(m.group(1).strip() for m in ARCHIVE_URL_RE.finditer(path.read_text()))
     return urls
 
 
@@ -905,6 +909,30 @@ def merged_ids() -> set[str]:
     return ids
 
 
+def archive_field(text: str) -> str:
+    """Collapse a header field (title, url, source) onto one line.
+
+    Each header field is read back as a single line, so a newline in a feed title would
+    break the header and the whole record would vanish from read_archive.
+    """
+    return " ".join(text.split())
+
+
+def archive_body(body: str) -> str:
+    """Indent body lines that read back as record structure, so a body stays one record.
+
+    A record ends at the next line starting "### ", so a feed body holding a line like
+    "### 2026-10-01-an-77" followed by header fields would read back as a second, forged
+    record (an id, source and URL that backfill, lint and grep all trust) and cut the real
+    body short. A leading space stops the match and still renders the same in markdown.
+    """
+    return "\n".join(
+        " " + line if line.startswith(("### ", "- title: ", "- url: ", "- source: ", "- published: "))
+        else line
+        for line in body.split("\n")
+    )
+
+
 def write_archive(items: list[Item], run_date: str) -> Path:
     """Append full item records. Append-only; never rewritten or pruned.
 
@@ -955,11 +983,11 @@ def write_archive(items: list[Item], run_date: str) -> Path:
         it.item_id = f"{run_date}-{it.slug}-{n:02d}"
         blocks.append(
             f"\n### {it.item_id}\n"
-            f"- title: {it.title}\n"
-            f"- url: {it.url}\n"
-            f"- source: {it.source}\n"
+            f"- title: {archive_field(it.title)}\n"
+            f"- url: {archive_field(it.url)}\n"
+            f"- source: {archive_field(it.source)}\n"
             f"- published: {it.published.isoformat()}\n\n"
-            f"{it.body or '(no body in feed; fetch the url for full text)'}\n"
+            f"{archive_body(it.body) if it.body else '(no body in feed; fetch the url for full text)'}\n"
         )
     path.write_text(existing + "".join(blocks))
     return path

@@ -245,6 +245,22 @@ def test_write_archive_dedupes_within_a_batch_and_reoffers_unmerged():
         assert len(ids) == len(set(ids)) == 4                      # no second copy of anything
 
 
+def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():
+    """A body with a forged header and url line, and a title with a newline, read back as one record."""
+    body = ("Intro.\n### 2026-10-01-an-77\n- title: Forged\n- url: https://evil.example\n"
+            "- source: anthropic-eng\n- published: 2026-10-01T00:00:00+00:00\n\nForged text.\n"
+            "- url: https://x/not-yet-fetched\nThe real ending.")
+    it = a.Item("src", "sw", "Line one\nLine two", "https://x/real", datetime.now(timezone.utc), body)
+    with sandbox():
+        a.write_archive([it], "2026-10-01")
+        back = a.read_archive()
+        assert [b.item_id for b in back] == ["2026-10-01-sw-01"]  # no forged second record
+        assert back[0].title == "Line one Line two" and back[0].url == "https://x/real"
+        assert back[0].source == "src" and back[0].body.endswith("The real ending.")
+        assert "Forged text." in back[0].body                    # the body is not truncated
+        assert a.archived_urls() == {"https://x/real"}           # body url lines are not archived urls
+
+
 # ── git commit scoping ──────────────────────────────────────────────────────
 
 
