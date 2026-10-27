@@ -1489,6 +1489,17 @@ class MergeRejected(Exception):
     """A merge result failed the shrink guard twice; INDEX.md must stay untouched."""
 
 
+# A horizontal rule or setext underline ("---", "* * *", "===").
+_RULE = re.compile(r"\s*([-*_=])(?:\s*\1){2,}\s*$")
+# A line that starts its own Markdown block, so it is never joined onto the bullet above:
+# a list item of any marker, an ATX heading, a quote, a table row, an HTML block or comment.
+# "#1 on SWE-bench" is not a heading and does join.
+_OWN_BLOCK = re.compile(r"\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}(?:\s|$)|[<|>])")
+# A code fence opener: three or more backticks or tildes, and no backtick after them, so a
+# line that starts with inline ```code``` is not a fence.
+_FENCE = re.compile(r"\s*(`{3,}|~{3,})[^`]*$")
+
+
 def unwrap_claims(md: str) -> str:
     """Join each claim's continuation lines onto its bullet, so every claim is one line.
 
@@ -1496,17 +1507,22 @@ def unwrap_claims(md: str) -> str:
     whole claim. A claim wrapped over two lines (the prompt used to allow it) carries its
     ids on the second line, so prune deleted only the first line and left the ids behind
     as an orphan, the deletion went unlogged, and a watchlist term on the second line was
-    not protected. Sub-bullets, headings, comments, blank lines and code fences are kept
-    as they are, and nothing inside a fenced block is joined.
+    not protected. Lines that start their own block (_OWN_BLOCK, _RULE), blank lines and code
+    fences are kept as they are, and nothing inside a fenced block is joined. A fence is
+    closed only by the same character at least as long, as in CommonMark.
     """
     out: list[str] = []
-    in_fence = False
+    fence = ""                      # the open fence's run of ` or ~, empty outside a fence
     for ln in md.splitlines():
         s = ln.strip()
-        if s.startswith("```"):
-            in_fence = not in_fence
-        elif (not in_fence and s and out and out[-1].lstrip().startswith(("- ", "* "))
-              and not s.startswith(("- ", "* ", "#", "<!--", "|", ">"))):
+        m = _FENCE.match(ln)
+        if fence:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and s == m.group(1):
+                fence = ""
+        elif m:
+            fence = m.group(1)
+        elif (s and out and out[-1].lstrip().startswith(("- ", "* "))
+              and not _RULE.match(out[-1]) and not _OWN_BLOCK.match(ln) and not _RULE.match(ln)):
             out[-1] = out[-1].rstrip() + " " + s
             continue
         out.append(ln)
