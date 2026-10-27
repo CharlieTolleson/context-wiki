@@ -563,14 +563,23 @@ def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Ite
     in October 2026). The day loop already starts at the watermark day, and
     write_archive drops any URL that is already archived, so re-reading the watermark
     day costs nothing. `publishedAt` is kept on the item for attribution.
+
+    Raises:
+        RuntimeError: when any listing day failed. Swallowing the error let main()
+            advance the watermark past that day, so a day that returned 503 was never
+            fetched again. Raising holds the watermark, as fetch_hn does; the good
+            days' papers are refetched next run.
     """
     items: list[Item] = []
+    failed: list[str] = []
     today = datetime.now(timezone.utc).date()
     day = max(since.date(), today - timedelta(days=LOOKBACK_CAP_DAYS))
     while day <= today:
         try:
             data = json.loads(http_get(f"{url}?date={day.isoformat()}"))
-        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            log(f"  WARN hf papers {day.isoformat()}: {type(exc).__name__}")
+            failed.append(day.isoformat())
             day += timedelta(days=1)
             continue
         for entry in data:
@@ -585,6 +594,8 @@ def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Ite
                 strip_html(paper.get("summary") or entry.get("summary") or "")[:MAX_BODY_CHARS],
             ))
         day += timedelta(days=1)
+    if failed:
+        raise RuntimeError(f"{len(failed)} listing day(s) failed ({', '.join(failed)})")
     return items
 
 
@@ -919,7 +930,7 @@ def write_archive(items: list[Item], run_date: str) -> Path:
     """
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     known = archived_urls()
-    existing_ids: dict[str, str] | None = None
+    archived: dict[str, Item] | None = None
     done: set[str] = set()
     fresh: list[Item] = []
     seen_in_batch: set[str] = set()
@@ -935,12 +946,18 @@ def write_archive(items: list[Item], run_date: str) -> Path:
                 # Archived by an earlier run. If that run never merged it (the merge
                 # failed or was rejected), reuse its id so it is merged now instead of
                 # being skipped forever. Otherwise it is finished and is skipped.
-                if existing_ids is None:
-                    existing_ids = {a.url: a.item_id for a in read_archive() if a.url}
+                if archived is None:
+                    archived = {a.url: a for a in read_archive() if a.url}
                     done = merged_ids()
-                old = existing_ids.get(i.url)
-                if old and old not in done:
-                    i.item_id = old
+                prev = archived.get(i.url)
+                if prev and prev.item_id not in done:
+                    i.item_id = prev.item_id
+                    # The refetch usually carries only the feed's title or teaser, and
+                    # enrich_thin skips archived URLs, so without this the merge would see
+                    # the thin body, reject it, and the archived full text would never be used.
+                    if (len(prev.body) > len(i.body or "")
+                            and not prev.body.startswith(NO_BODY_PLACEHOLDER)):
+                        i.body = prev.body
                     revived += 1
                 continue  # never append a second copy
         fresh.append(i)
