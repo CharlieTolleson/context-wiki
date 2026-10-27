@@ -288,6 +288,19 @@ def test_write_archive_reoffer_keeps_the_archived_full_body():
         assert A2.body == full.strip()                             # archived body, not the teaser
 
 
+def test_write_archive_dedupes_a_url_holding_whitespace_across_runs():
+    """A url with a newline is stored collapsed; a later run offering it again adds no record."""
+    with sandbox():
+        A = a.Item("src", "sw", "T", "https://x/a\nb", datetime.now(timezone.utc), "B")
+        assert A.url == "https://x/a b"                             # normalised once, at construction
+        a.write_archive([A], "2026-10-01")
+        a.INDEX_PATH.write_text(f"## S\n\n- claim [{A.item_id}]\n")    # merged
+        A2 = a.Item("src", "sw", "T", "https://x/a\nb", datetime.now(timezone.utc), "B")
+        a.write_archive([A2], "2026-10-02")
+        assert A2.item_id == ""                                    # skipped, not archived again
+        assert [b.item_id for b in a.read_archive()] == ["2026-10-01-sw-01"]
+
+
 # ── git commit scoping ──────────────────────────────────────────────────────
 
 

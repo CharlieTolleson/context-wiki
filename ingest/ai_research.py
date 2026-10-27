@@ -253,6 +253,15 @@ class Item:
     body: str
     item_id: str = ""
 
+    def __post_init__(self) -> None:
+        # The archive stores the url through archive_field, which collapses whitespace, so
+        # dedupe must compare that same form. Normalising here, where every fetcher, --add-url
+        # and read_archive build an Item, means the batch check, the archived-url check, the
+        # revive lookup and enrich_thin all see the stored url. Comparing the raw url let a feed
+        # url holding a newline or other whitespace miss dedupe and be re-archived and
+        # re-merged every run.
+        self.url = archive_field(self.url)
+
 
 def log(msg: str) -> None:
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
