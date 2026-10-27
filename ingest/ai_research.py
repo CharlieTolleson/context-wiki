@@ -39,6 +39,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import html
 import http.client
 import ipaddress
@@ -49,6 +50,7 @@ import re
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -305,14 +307,20 @@ class UnsafeURLError(urllib.error.URLError):
     """
 
 
+_EMBEDS_IPV4 = tuple(ipaddress.ip_network(n) for n in
+                     ("::ffff:0:0/96", "::/96", "64:ff9b::/96", "::ffff:0:0:0/96"))
+
+
 def _require_public(host: str, addr: str) -> None:
     """Raise UnsafeURLError unless addr is a globally routable unicast address."""
     # IPv6 results can carry a zone suffix ("fe80::1%en0") that ip_address rejects.
     ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
-    # ::ffff:127.0.0.1 is loopback in disguise; judge the embedded IPv4 address.
-    mapped = getattr(ip, "ipv4_mapped", None)
-    if mapped is not None:
-        ip = mapped
+    # ::ffff:127.0.0.1 is loopback in disguise; judge the embedded IPv4 address. The same
+    # goes for the other forms that carry an IPv4 address in their last 32 bits: NAT64
+    # (64:ff9b::7f00:1 reaches 127.0.0.1 through a translator), the deprecated
+    # IPv4-compatible ::127.0.0.1, and the SIIT-translated ::ffff:0:a.b.c.d.
+    if ip.version == 6 and any(ip in net for net in _EMBEDS_IPV4):
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
     if not ip.is_global or ip.is_multicast:
         raise UnsafeURLError(f"refusing {host!r}: resolves to non-public address {ip}")
 
@@ -383,7 +391,7 @@ class _CheckedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-FETCH_DEADLINE = 120   # seconds for one whole response body; HTTP_TIMEOUT only bounds each socket call
+FETCH_DEADLINE = 120   # seconds for one whole request (connect, headers, redirects, body)
 HTML_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
 
 
@@ -413,26 +421,107 @@ def _public_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, s
     raise err or OSError(f"no address for {host!r}")
 
 
-class _PublicHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, *args, **kwargs):
+class _Deadline:
+    """The wall-clock budget of one http_get, enforced on every socket it opens.
+
+    HTTP_TIMEOUT bounds each socket call, so a server trickling header bytes, or a
+    chain of redirects, could hold a fetch open far past any per-call timeout. Each
+    socket is registered here as it connects; when the budget runs out a timer shuts
+    them all down, which makes the blocked recv return at once. A dup of each socket
+    is kept because https wraps (and detaches) the original before its handshake.
+    """
+
+    def __init__(self, seconds: float):
+        self.end = time.monotonic() + seconds
+        self.expired = False
+        self._socks: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    @property
+    def passed(self) -> bool:
+        return self.expired or time.monotonic() >= self.end
+
+    def track(self, sock: socket.socket) -> None:
+        twin = sock.dup()
+        with self._lock:
+            self._socks.append(twin)
+            late = self.expired
+        if late:
+            self._shut(twin)
+
+    def _expire(self) -> None:
+        with self._lock:
+            self.expired = True
+            socks = list(self._socks)
+        for sock in socks:
+            self._shut(sock)
+
+    @staticmethod
+    def _shut(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass   # already closed, or never connected
+
+    def close(self) -> None:
+        self._timer.cancel()
+        with self._lock:
+            socks, self._socks = self._socks, []
+        for sock in socks:
+            sock.close()
+
+
+def _connector(deadline: _Deadline, check_public: bool):
+    """A create_connection that caps the connect at the time left and registers the socket.
+
+    A shutdown cannot interrupt a connect in progress, so the connect timeout itself
+    is cut to whatever remains of the budget.
+    """
+    def create(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *_a, **_k):
+        left = deadline.end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("fetch deadline passed before connecting")
+        if timeout is socket._GLOBAL_DEFAULT_TIMEOUT or timeout is None or timeout > left:
+            timeout = left
+        connect = _public_create_connection if check_public else socket.create_connection
+        sock = connect(address, timeout, source_address)
+        deadline.track(sock)
+        return sock
+    return create
+
+
+class _TrackedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, connector, **kwargs):
         super().__init__(*args, **kwargs)
-        self._create_connection = _public_create_connection
+        self._create_connection = connector
 
 
-class _PublicHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, *args, **kwargs):
+class _TrackedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, connector, **kwargs):
         super().__init__(*args, **kwargs)
-        self._create_connection = _public_create_connection
+        self._create_connection = connector
 
 
-class _PublicHTTPHandler(urllib.request.HTTPHandler):
+class _TrackedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, connector):
+        super().__init__()
+        self.connector = connector
+
     def http_open(self, req):
-        return self.do_open(_PublicHTTPConnection, req)
+        return self.do_open(functools.partial(_TrackedHTTPConnection, connector=self.connector), req)
 
 
-class _PublicHTTPSHandler(urllib.request.HTTPSHandler):
+class _TrackedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, connector):
+        super().__init__()
+        self.connector = connector
+
     def https_open(self, req):
-        return self.do_open(_PublicHTTPSConnection, req, context=self._context)
+        return self.do_open(functools.partial(_TrackedHTTPSConnection, connector=self.connector), req,
+                            context=self._context)
 
 
 def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...] | None = None) -> bytes:
@@ -445,9 +534,10 @@ def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...]
 
     With allow_private=False the address actually connected to is checked at
     connect time, on every hop, and no proxy is used (a proxy would do its own,
-    unchecked, resolution). The body is read against a wall-clock FETCH_DEADLINE,
-    because HTTP_TIMEOUT bounds each socket call, so a server trickling one byte
-    at a time could otherwise hold the run open forever.
+    unchecked, resolution). The whole request (connect, headers, every redirect
+    hop, and the body) runs against a wall-clock FETCH_DEADLINE, because
+    HTTP_TIMEOUT bounds each socket call, so a server trickling one byte at a time
+    could otherwise hold the run (and enrich_thin's pool) open forever.
 
     Args:
         url: http or https URL to fetch.
@@ -461,21 +551,24 @@ def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...]
         and a warning is logged).
 
     Raises:
-        UnsafeURLError: the URL or a redirect target is refused (at connect
-            time it arrives wrapped in a URLError).
+        UnsafeURLError: the URL, a redirect target, or the address connected
+            to is refused.
         urllib.error.URLError / HTTPError: the request failed, including read
             timeouts, resets, and bodies cut short, which urllib would otherwise
             raise unwrapped and so past every caller's `except URLError`.
     """
     check_url(url, allow_private)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    handlers: list = [_CheckedRedirectHandler(allow_private)]
+    deadline = _Deadline(FETCH_DEADLINE)
+    connector = _connector(deadline, check_public=not allow_private)
+    handlers: list = [_CheckedRedirectHandler(allow_private),
+                      _TrackedHTTPHandler(connector), _TrackedHTTPSHandler(connector)]
     if not allow_private:
-        handlers += [_PublicHTTPHandler(), _PublicHTTPSHandler(), urllib.request.ProxyHandler({})]
-    opener = urllib.request.build_opener(*handlers)
-    deadline = time.monotonic() + FETCH_DEADLINE
+        handlers.append(urllib.request.ProxyHandler({}))
+    late = f"{url}: no complete response within {FETCH_DEADLINE}s"
     chunks: list[bytes] = []
     try:
+        opener = urllib.request.build_opener(*handlers)
         with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
             if accept_types is not None:
                 ctype = (resp.headers.get_content_type() or "").lower()
@@ -493,14 +586,25 @@ def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...]
                     break
                 chunks.append(chunk)
                 total += len(chunk)
-                if time.monotonic() > deadline:
-                    raise urllib.error.URLError(f"{url}: body not complete after {FETCH_DEADLINE}s")
-    except urllib.error.URLError:
+                if deadline.passed:
+                    raise urllib.error.URLError(late)
+            if deadline.expired:   # the shutdown can look like a clean EOF; a cut body is no body
+                raise urllib.error.URLError(late)
+    except urllib.error.URLError as exc:
+        if deadline.passed:
+            raise urllib.error.URLError(late) from exc
+        if isinstance(exc.reason, UnsafeURLError):
+            # urllib wraps a connect-time refusal in a second URLError; surface the refusal itself.
+            raise exc.reason from None
         raise
     except (OSError, http.client.HTTPException) as exc:
+        if deadline.passed:
+            raise urllib.error.URLError(late) from exc
         # Read timeouts, resets and IncompleteRead escape urllib unwrapped; normalise them so
         # every caller's `except URLError` really is "this fetch failed", not "abort the run".
         raise urllib.error.URLError(exc) from exc
+    finally:
+        deadline.close()
     body = b"".join(chunks)
     if len(body) > MAX_FETCH_BYTES:
         log(f"  WARN {url}: response over {MAX_FETCH_BYTES} bytes, truncated")

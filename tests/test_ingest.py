@@ -598,10 +598,14 @@ def test_add_url_refuses_loopback_private_and_link_local_ips():
     """Literal non-public addresses are refused for user URLs but still allowed for built-in sources."""
     for url in ("http://127.0.0.1:4000/v1/models", "http://10.0.0.5/", "http://192.168.1.1/",
                 "http://169.254.169.254/latest/meta-data/", "http://[::1]/", "http://[::ffff:127.0.0.1]/",
-                "http://0.0.0.0/", "http://100.64.0.1/"):
+                "http://0.0.0.0/", "http://100.64.0.1/",
+                # IPv6 forms carrying a private IPv4 address: NAT64, IPv4-compatible, SIIT-translated
+                "http://[64:ff9b::7f00:1]/", "http://[64:ff9b::a9fe:a9fe]/", "http://[::127.0.0.1]/",
+                "http://[::ffff:0:7f00:1]/"):
         assert refused(url, allow_private=False), url
         assert not refused(url, allow_private=True), url
     assert not refused("https://8.8.8.8/", allow_private=False)        # public literal passes
+    assert not refused("https://[64:ff9b::808:808]/", allow_private=False)   # NAT64 of a public address
 
 
 def test_add_url_refuses_a_name_with_any_private_address():
@@ -724,8 +728,8 @@ def test_http_get_refuses_a_host_that_rebinds_to_loopback_at_connect_time(monkey
         try:
             a.http_get(f"http://rebind.example:{port}/", allow_private=False)
             raise AssertionError("expected a refusal")
-        except a.urllib.error.URLError as exc:
-            assert "non-public" in str(exc)
+        except a.UnsafeURLError as exc:   # the refusal itself, not wrapped in a second URLError
+            assert "non-public" in str(exc.reason) and "urlopen error" not in str(exc.reason)
         assert handler.hits == 0
 
 
@@ -745,8 +749,38 @@ def test_http_get_bounds_a_trickled_body_by_wall_clock(monkeypatch):
             a.http_get(f"http://127.0.0.1:{port}/")
             raise AssertionError("expected a deadline error")
         except a.urllib.error.URLError as exc:
-            assert "not complete" in str(exc)
+            assert "no complete response" in str(exc)
         assert time.monotonic() - started < 3
+
+
+def test_http_get_deadline_covers_headers_and_redirects(monkeypatch):
+    """Trickled header lines or an endless redirect chain end at FETCH_DEADLINE, not after HTTP_TIMEOUT per hop."""
+    import time
+    _no_proxy(monkeypatch)
+
+    def slow_headers(h):
+        h.wfile.write(b"HTTP/1.1 200 OK\r\n")
+        for _ in range(40):
+            try:
+                h.wfile.write(b"X-A: b\r\n"); h.wfile.flush()
+            except OSError:
+                return
+            time.sleep(0.05)
+
+    def loop(h):   # urllib stops after 10 hops, so 10 x 0.1s outlasts the 0.3s budget
+        time.sleep(0.1)
+        h.send_response(302); h.send_header("Location", f"/{h.path.count('/') + 1}" + h.path)
+        h.send_header("Content-Length", "0"); h.end_headers()
+    monkeypatch.setattr(a, "FETCH_DEADLINE", 0.3)
+    for body in (slow_headers, loop):
+        with local_server(body) as (port, _):
+            started = time.monotonic()
+            try:
+                a.http_get(f"http://127.0.0.1:{port}/")
+                raise AssertionError("expected a deadline error")
+            except a.urllib.error.URLError as exc:
+                assert "no complete response within 0.3s" in str(exc), exc
+            assert time.monotonic() - started < 1.5
 
 
 def test_http_get_wraps_read_errors_and_refuses_unwanted_types(monkeypatch):
