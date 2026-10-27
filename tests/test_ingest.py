@@ -1147,6 +1147,25 @@ def test_radar_picks_none_without_an_array():
     assert a.parse_radar_picks("[not json]", _radar_cands("vllm")) is None
 
 
+
+def test_radar_picks_skip_bracketed_prose_before_the_answer():
+    """Brackets in reasoning or prose before the answer do not hide the real array."""
+    cands = _radar_cands("codemode", "france", "tool search")
+    assert [c.term for c in a.parse_radar_picks("Candidates (see [notes]): [0, 2]", cands)] == \
+        ["codemode", "tool search"]
+    assert [c.term for c in a.parse_radar_picks("<think>maybe [codemode]?</think>\n[2]", cands)] == \
+        ["tool search"]
+
+
+def test_radar_picks_accept_python_style_and_quoted_number_replies():
+    """Single-quoted terms and numbers sent as strings still map to candidates."""
+    cands = _radar_cands("vllm", "codemode", "france")
+    assert [c.term for c in a.parse_radar_picks("['vllm', 'codemode']", cands)] == ["vllm", "codemode"]
+    assert [c.term for c in a.parse_radar_picks('["\'vllm\'"]', cands)] == ["vllm"]
+    assert [c.term for c in a.parse_radar_picks('["0", "1"]', cands)] == ["vllm", "codemode"]
+    assert a.parse_radar_picks("[]", cands) == []
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
