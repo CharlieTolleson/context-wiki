@@ -51,6 +51,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -118,6 +119,9 @@ DROPPED_PATH = STATE_DIR / "dropped_claims.jsonl"   # every claim a merge remove
 RECALL_PATH = STATE_DIR / "RECALL.md"               # latest coverage report (local, regenerated each run)
 # Held for the whole of any run that writes, so the daily job and a manual run never interleave.
 LOCK_PATH = STATE_DIR / "run.lock"
+# atomic_write temp files start with this, so the orphan sweep and a vault .gitignore can match
+# ours alone: WIKI_DIR is often a vault folder that other tools (Syncthing, editors) also use.
+TEMP_PREFIX = ".ctxwiki."
 # Optional separate file for the endpoint credentials, so secrets can live in one shared place.
 ENV_PATH = Path(setting("WIKI_ENV_FILE", str(LOCAL_ENV))).expanduser()
 # Concepts that must be covered; see radar.parse_watchlist for the format.
@@ -137,6 +141,9 @@ MERGE_CHUNK = 15         # items per LLM call. 60 in one prompt made gpt-4o rewr
 MAX_BACKFILL_PASSES = 8  # bound a backfill; quota-capped sources would otherwise
                          # need ~50 passes to drain, one LLM call each
 HTTP_TIMEOUT = 45
+LOCK_WAIT_SECONDS = 2 * 60 * 60  # give up on the run lock after this; a stuck manual run would otherwise
+                                 # make every scheduled run queue behind it silently for days
+LOCK_POLL_SECONDS = 5    # how often a waiting run retries the lock
 RADAR_WINDOW_DAYS = 21   # "recent" for emerging-term detection; older archive is the baseline
 RADAR_MODEL = setting("WIKI_RADAR_MODEL", "cheap")   # small model: filters candidate terms, never writes the wiki
 RADAR_SEARCH_TERMS = 8   # max terms per run sent to targeted Hacker News search
@@ -863,12 +870,24 @@ def atomic_write(path: Path, text: str) -> None:
     state.json or archive day. A cut-off INDEX.md is worse than a lost write: it becomes the
     next merge's input and the shrink guard measures against it. The temp file lives in the
     same directory because os.replace is only atomic within one filesystem.
+
+    A symlink is followed and its target replaced, as write_text did; replacing the path
+    itself would swap the link for a regular file and cut it off from what it pointed at.
     """
+    if path.is_symlink():
+        path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f"{TEMP_PREFIX}{path.name}.", suffix=".tmp")
     try:
-        # mkstemp creates the file 0600; keep the mode the file had, or the usual 0644.
-        os.chmod(tmp, path.stat().st_mode & 0o777 if path.exists() else 0o644)
+        # mkstemp creates the file 0600. Keep the mode an existing file had; give a new one
+        # 0666 less the umask, as write_text would. os.umask can only be read by setting it.
+        if path.exists():
+            mode = path.stat().st_mode & 0o777
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(tmp, mode)
         with os.fdopen(fd, "w") as fh:
             fh.write(text)
             fh.flush()
@@ -886,9 +905,11 @@ def sweep_temp_files() -> None:
     The cleanup in atomic_write does not run on SIGKILL, or on the SIGTERM launchd sends on
     unload, and commit() stages ARCHIVE_DIR and TOPICS_DIR whole, so an orphan would be
     committed and kept forever. Called with the run lock held, so no live write is touched.
+    Only TEMP_PREFIX files are matched: WIKI_DIR may be a vault folder, and a broader
+    pattern deleted other tools' in-flight temp files (Syncthing's .syncthing.*.tmp, say).
     """
     for folder in {WIKI_DIR, TOPICS_DIR, ARCHIVE_DIR, STATE_DIR}:
-        for tmp in folder.glob(".*.tmp") if folder.is_dir() else ():
+        for tmp in folder.glob(f"{TEMP_PREFIX}*.tmp") if folder.is_dir() else ():
             with contextlib.suppress(OSError):
                 tmp.unlink()
                 log(f"removed {tmp.name}, left by an interrupted run")
@@ -2255,6 +2276,9 @@ def run_lock():
     --add-url, say) produced duplicate item ids, and the later write erased the earlier one's
     records and merge. Waiting rather than failing means a manual add simply runs after the
     job. flock is released by the OS when the process dies, so a crash never leaves it stuck.
+    The wait is bounded by LOCK_WAIT_SECONDS: a manual run left stuck would otherwise make
+    every launchd run hang behind it with nothing in the log but one line. The holder writes
+    its PID into the lock file so the waiting line says which process to look at.
     """
     try:
         LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2265,11 +2289,25 @@ def run_lock():
         log(f"ERROR cannot create the run lock {LOCK_PATH}: {exc}")
         raise SystemExit(1) from exc
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            log("another run holds the lock; waiting for it to finish")
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.time() + LOCK_WAIT_SECONDS
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not waiting:
+                    holder = os.pread(fd, 32, 0).decode(errors="replace").strip() or "unknown"
+                    log(f"another run (pid {holder}) holds the lock; waiting up to "
+                        f"{LOCK_WAIT_SECONDS // 60} min for it to finish")
+                    waiting = True
+                if time.time() >= deadline:
+                    log(f"ERROR the run lock {LOCK_PATH} was still held after "
+                        f"{LOCK_WAIT_SECONDS // 60} min; giving up. Check the process named above.")
+                    raise SystemExit(1)
+                time.sleep(LOCK_POLL_SECONDS)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
         sweep_temp_files()
         yield
     finally:

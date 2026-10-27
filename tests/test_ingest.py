@@ -283,18 +283,79 @@ def _lock_is_free() -> bool:
         os.close(fd)
 
 
+def test_atomic_write_writes_through_a_symlink():
+    """A symlinked INDEX.md keeps its link; the file it points at gets the new text."""
+    with sandbox() as tmp:
+        real = tmp / "elsewhere"
+        real.mkdir()
+        (real / "INDEX.md").write_text("old\n")
+        (tmp / "INDEX.md").symlink_to(real / "INDEX.md")
+        a.atomic_write(tmp / "INDEX.md", "new\n")
+        assert (tmp / "INDEX.md").is_symlink()
+        assert (real / "INDEX.md").read_text() == "new\n"
+
+
+def test_atomic_write_honours_the_umask_and_keeps_an_existing_mode():
+    """A new file gets 0666 less the umask, as write_text gave it; an existing file keeps its mode."""
+    with sandbox() as tmp:
+        old = os.umask(0o077)
+        try:
+            a.atomic_write(tmp / "new.md", "x\n")
+        finally:
+            os.umask(old)
+        assert (tmp / "new.md").stat().st_mode & 0o777 == 0o600
+        (tmp / "kept.md").write_text("x\n")
+        os.chmod(tmp / "kept.md", 0o640)
+        a.atomic_write(tmp / "kept.md", "y\n")
+        assert (tmp / "kept.md").stat().st_mode & 0o777 == 0o640
+
+
 def test_run_lock_sweeps_temp_files_left_by_a_killed_run():
     """An orphaned atomic_write temp file is removed before it can be committed; real files stay."""
     with sandbox() as tmp:
         a.ARCHIVE_DIR.mkdir()
-        orphan = a.ARCHIVE_DIR / ".2026-10-27.md.k3j2.tmp"
+        orphan = a.ARCHIVE_DIR / ".ctxwiki.2026-10-27.md.k3j2.tmp"
         orphan.write_text("half")
         keep = a.ARCHIVE_DIR / "2026-10-27.md"
         keep.write_text("# Archive\n")
-        (tmp / ".INDEX.md.abcd.tmp").write_text("half")
+        (tmp / ".ctxwiki.INDEX.md.abcd.tmp").write_text("half")
         with a.run_lock():
             pass
-        assert not orphan.exists() and not (tmp / ".INDEX.md.abcd.tmp").exists() and keep.exists()
+        assert not orphan.exists() and not (tmp / ".ctxwiki.INDEX.md.abcd.tmp").exists() and keep.exists()
+
+
+def test_run_lock_sweep_leaves_other_tools_temp_files_alone():
+    """WIKI_DIR may be a vault folder: Syncthing's and the user's own .tmp files survive the sweep."""
+    with sandbox() as tmp:
+        foreign = [tmp / ".syncthing.Note.md.tmp", tmp / ".draft.tmp"]
+        for f in foreign:
+            f.write_text("not ours")
+        with a.run_lock():
+            pass
+        assert all(f.exists() for f in foreign)
+
+
+def test_run_lock_gives_up_after_the_wait_bound_and_names_the_holder():
+    """A lock held past LOCK_WAIT_SECONDS ends the run with exit 1 and the holder's PID in the log."""
+    import fcntl
+    with sandbox():
+        fd = os.open(a.LOCK_PATH, os.O_RDWR | os.O_CREAT)
+        os.write(fd, b"4242\n")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        saved = a.LOCK_WAIT_SECONDS, a.LOCK_POLL_SECONDS, a.log
+        lines: list[str] = []
+        a.LOCK_WAIT_SECONDS, a.LOCK_POLL_SECONDS, a.log = 0, 0, lines.append
+        try:
+            with a.run_lock():
+                raise AssertionError("the lock was taken while another run held it")
+        except SystemExit as exc:
+            assert exc.code == 1
+        finally:
+            a.LOCK_WAIT_SECONDS, a.LOCK_POLL_SECONDS, a.log = saved
+            os.close(fd)
+        assert "pid 4242" in lines[0] and lines[-1].startswith("ERROR")
+        with a.run_lock():                                          # free again: the holder's PID is ours now
+            assert a.LOCK_PATH.read_text() == f"{os.getpid()}\n"
 
 
 def test_writing_modes_hold_the_run_lock_and_release_it_after():

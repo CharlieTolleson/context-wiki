@@ -163,7 +163,7 @@ launchctl start com.example.context-wiki      # fire once now to test
 Things learned the hard way:
 
 - **Sleeping laptops.** A job that fires while the Mac is asleep starts in a short maintenance wake and is put back to sleep mid-run, which shows up as socket timeouts and an LLM call that finishes hours late. The template wraps the job in `caffeinate -i` for this reason.
-- **One run at a time.** Every mode that writes takes a lock (`run.lock` in `WIKI_STATE_DIR`), so a manual `--add-url` started during the scheduled job waits for it to finish instead of interleaving with it. Files are replaced atomically, so a killed run never leaves a half-written `INDEX.md`.
+- **One run at a time.** Every mode that writes takes a lock (`run.lock` in `WIKI_STATE_DIR`), so a manual `--add-url` started during the scheduled job waits for it to finish instead of interleaving with it. A run gives up with an error after two hours (`LOCK_WAIT_SECONDS`), and the log names the PID holding the lock. Files are replaced atomically, so a killed run never leaves a half-written `INDEX.md`; the temp files start with `.ctxwiki.` and the next run removes any a killed run left behind. If a vault sync job commits the wiki folder, add `.ctxwiki.*` to the vault's `.gitignore` so one is never committed mid-run.
 - **Missed days heal themselves.** Each source keeps its own watermark and only advances it on success, so a skipped day or a failed source is picked up on the next run (up to `LOOKBACK_CAP_DAYS`).
 - **launchd and time zones.** launchd's calendar scheduler can keep using the time zone it started with. After travelling across zones, a job may fire hours off schedule until you reboot or log out and back in.
 
