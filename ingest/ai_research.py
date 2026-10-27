@@ -1087,7 +1087,8 @@ def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.C
     Returns:
         Up to 8 picked candidates, de-duplicated in reply order. The answer is found by
         structure, not position: a reply (or ```json fence) that is itself JSON is read
-        directly; otherwise the first bracketed array that names a candidate wins. [] when
+        directly; otherwise the first number array that names a candidate wins, then the
+        first term array that names one (an echo of every candidate is skipped). [] when
         the answer names no candidate; None when the reply holds no parseable array, or is a
         JSON object with no answer key (the caller logs that as a filter failure).
     """
@@ -1158,19 +1159,23 @@ def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.C
             values = answer_of(obj)
             return picks(values) if values is not None else None
 
-    # Prose around the answer: take the first array that names a candidate. Arrays that
-    # name none (a thought like "maybe [9]?", "[notes]", a year, an empty "Others: []") are
-    # skipped, so they neither hide nor override the answer.
-    found_any = False
-    for found in re.finditer(r"\[[^\[\]]*\]", text):
-        values = load(found.group(0))
-        if not isinstance(values, list):
-            continue
-        found_any = True
+    # Prose around the answer. Numbers are the format asked for, so the first number array
+    # that names a candidate wins; only without one is the first term array read. Arrays
+    # that name none (a thought like "maybe [9]?", "[notes]", a year, an empty "Others: []")
+    # are skipped, so they neither hide nor override the answer. A term array naming every
+    # candidate (3 or more) echoes the input and is never an answer.
+    arrays = [v for v in (load(m.group(0)) for m in re.finditer(r"\[[^\[\]]*\]", text))
+              if isinstance(v, list)]
+    if not arrays:
+        return None
+    numeric = [v for v in arrays if v and all(as_number(x) is not None for x in v)]
+    for values in numeric:
         if picked := picks(values):
             return picked
-    if not found_any:
-        return None
+    for values in arrays:
+        picked = picks(values)
+        if picked and not (len(cands) >= 3 and len(picked) == len(cands)):
+            return picked
     log(f"NOTE radar filter reply arrays matched no candidate: {raw[:80]!r}")
     return []
 

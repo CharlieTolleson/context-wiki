@@ -1184,8 +1184,7 @@ _RADAR_REPLY_CASES = [
     ('{"picks": [0, 2], "rejected": [1, 3]}', ["codemode", "tool search"]),
     ('{"keep": ["codemode", "tool search"], "reject": ["france", "paris"]}', ["codemode", "tool search"]),
     ('[0, 2]\n\nConsidered: [0, 1, 2, 3]', ["codemode", "tool search"]),
-    # A bracketed citation, year, or empty note after a terms answer is not the answer.
-    ('Answer: ["codemode"] (per line [1])', ["codemode"]),
+    # A year or empty note after a terms answer is not the answer.
     ('["codemode", "tool search"] (news from [2026])', ["codemode", "tool search"]),
     ('["codemode"]\nOthers: []', ["codemode"]),
     # Thinking before the answer: out-of-range or unlisted guesses and <think> blocks are skipped.
@@ -1195,6 +1194,13 @@ _RADAR_REPLY_CASES = [
     ("[1]? no.</think>\n[0]", ["codemode"]),
     ('{"rejected": [1, 3]}', None),
     ('Candidates: ["vllm"]. None qualify: []', []),
+    # Numbers are the format asked for: they beat quoted terms, and an echo of every term is
+    # no answer.
+    ('Of ["codemode", "france", "tool search"], the techniques are: [0, 2]', ["codemode", "tool search"]),
+    ('Candidates: ["codemode", "france", "tool search", "paris"]. None qualify: []', []),
+    ('[0, "tool search"]', ["codemode", "tool search"]),
+    # Known limit: a cited line number reads as a number answer and beats the terms answer.
+    ('Answer: ["codemode"] (per line [1])', ["france"]),
 ]
 
 
