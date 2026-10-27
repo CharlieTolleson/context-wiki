@@ -259,6 +259,7 @@ class Item:
     item_id: str = ""
     revived: bool = False   # archived by an earlier run that never merged it (write_archive)
     retry: bool = False     # and its merge chunk failed then, so it goes first (plan_chunks)
+    refused: bool = False   # a guard rejected it in a chunk of its own (merge_chunked)
 
 
 def log(msg: str) -> None:
@@ -1635,15 +1636,13 @@ def plan_chunks(items: list[Item]) -> list[list[Item]]:
 
     The guards reject a whole chunk, so a failed chunk only says that one of its items is
     bad. An item whose chunk failed in an earlier run (retry) goes in a chunk of its own, and
-    record_merge_failures counts a strike only for an item that failed alone, so the
+    record_merge_failures counts a strike only for an item a guard refused alone, so the
     chunk-mates of a poisoned item are not given up with it. Bisecting a failed chunk in the
     same run would find the item sooner but costs about eight calls per bad item; this costs
     one call per isolated item, in the runs after a failure only. At most MAX_SOLO_MERGES
     items go alone (oldest first, so none waits forever behind newer ones), so a run makes at
     most that many extra calls where one failed chunk would otherwise mean fifteen; the rest
     share chunks as usual and stay pending until a later run isolates them.
-
-    Deterministic, so record_merge_failures rebuilds exactly the chunks merge_chunked sent.
     """
     solo = sorted((i for i in items if i.retry), key=lambda i: i.published)[:MAX_SOLO_MERGES]
     alone = {id(i) for i in solo}
@@ -1677,11 +1676,16 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
     """
     current, merged, failures = index_md, [], 0
     chunks = plan_chunks(items)
+    for i in items:
+        i.refused = False
     for n, chunk in enumerate(chunks, start=1):
         try:
             out = merge_checked(current, chunk, creds, hint=hint)
         except Exception as exc:
             failures += 1
+            # Only a guard refusal of a lone item says the item is bad (record_merge_failures);
+            # a connection error or timeout says nothing about it.
+            chunk[0].refused = len(chunk) == 1 and isinstance(exc, MergeRejected)
             log(f"WARN chunk {n}/{len(chunks)} failed: {type(exc).__name__}: {str(exc)[:160]}")
             continue
         if not out:
@@ -1727,9 +1731,12 @@ def record_merge_failures(offered: list[Item], merged: list[Item]) -> set[str]:
     has no lookback window. A given-up item is no longer re-offered or refetched; it stays
     archived and unreviewed, so --backfill can still take it.
 
-    Only a failure in a chunk of one counts. Items of a failed shared chunk are recorded
-    with no strike, which makes the next run merge each alone (plan_chunks); counting them
-    gave up the innocent neighbours of a bad item after two shared failures.
+    Only a guard refusal in a chunk of one counts (Item.refused). Items of a failed shared
+    chunk are recorded with no strike, which makes the next run merge each alone
+    (plan_chunks); counting them gave up the innocent neighbours of a bad item after two
+    shared failures. A lone item that failed any other way (APIConnectionError, a timeout,
+    empty output) also gets no strike: the job hit LiteLLM connection errors at merge on
+    2026-10-24 and 10-25, and a two-day outage must not give up every item waiting its turn.
 
     Returns:
         Ids given up on in this run, whose sources need no watermark hold for them.
@@ -1739,20 +1746,19 @@ def record_merge_failures(offered: list[Item], merged: list[Item]) -> set[str]:
     for item_id in merged_now:
         retry["pending"].pop(item_id, None)
     gave_up: set[str] = set()
-    for chunk in plan_chunks(offered):
-        for i in chunk:
-            if i.item_id in merged_now:
-                continue
-            if len(chunk) > 1:
-                retry["pending"].setdefault(i.item_id, 0)
-                continue
-            n = retry["pending"].pop(i.item_id, 0) + 1
-            if n >= MAX_MERGE_FAILURES:
-                gave_up.add(i.item_id)
-            else:
-                retry["pending"][i.item_id] = n
+    for i in offered:
+        if i.item_id in merged_now:
+            continue
+        if not i.refused:
+            retry["pending"].setdefault(i.item_id, 0)
+            continue
+        n = retry["pending"].pop(i.item_id, 0) + 1
+        if n >= MAX_MERGE_FAILURES:
+            gave_up.add(i.item_id)
+        else:
+            retry["pending"][i.item_id] = n
     if gave_up:
-        log(f"WARN giving up on {len(gave_up)} item(s) after {MAX_MERGE_FAILURES} failed merges "
+        log(f"WARN giving up on {len(gave_up)} item(s) refused alone {MAX_MERGE_FAILURES} times "
             f"(left for --backfill): {', '.join(sorted(gave_up))[:200]}")
     retry["gave_up"] = sorted(set(retry["gave_up"]) | gave_up)
     RETRY_PATH.parent.mkdir(parents=True, exist_ok=True)

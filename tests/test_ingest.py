@@ -841,6 +841,7 @@ def test_record_merge_failures_retries_then_gives_up():
         again = a.Item("anthropic-eng", "ae", "bad", bad.url, now, "b")
         a.write_archive([again], "2026-01-02")
         assert again.retry and again.item_id == bad.item_id
+        again.refused = True                                        # as merge_chunked marks a lone guard refusal
         assert a.record_merge_failures([again], []) == set()
         assert a.record_merge_failures([again], []) == {bad.item_id}
         assert bad.url in a.finished_urls()                         # no longer refetched
@@ -886,6 +887,38 @@ def test_a_poisoned_item_does_not_get_its_chunk_mates_given_up():
                 done |= {i.item_id for i in merged}
             assert a.load_retry() == {"pending": {}, "gave_up": [items[3].item_id]}
             assert done == {i.item_id for i in items if i is not items[3]}
+    finally:
+        a.merge_checked = real
+
+
+def test_a_lone_item_that_fails_on_a_connection_error_is_not_given_up():
+    """Only a guard refusal is a strike: an outage on two runs leaves the waiting item pending."""
+    lone = item("ab", "https://x/lone")
+    lone.item_id, lone.retry = "2026-01-01-ab-01", True
+    real = a.merge_checked
+
+    def outage(index_md, chunk, creds, hint="", retries=1):
+        raise ConnectionError("APIConnectionError: Connection error.")
+    try:
+        a.merge_checked = outage
+        with sandbox(), capture_logs():
+            for _ in range(a.MAX_MERGE_FAILURES + 1):
+                try:
+                    a.merge_chunked("## S\n", [lone], {})
+                    raise AssertionError("expected MergeRejected")
+                except a.MergeRejected:
+                    pass
+                assert not lone.refused
+                assert a.record_merge_failures([lone], []) == set()
+            assert a.load_retry() == {"pending": {lone.item_id: 0}, "gave_up": []}
+            a.merge_checked = lambda *args, **kw: (_ for _ in ()).throw(a.MergeRejected("guard"))
+            try:
+                a.merge_chunked("## S\n", [lone], {})
+            except a.MergeRejected:
+                pass
+            assert lone.refused and a.load_retry()["pending"][lone.item_id] == 0
+            assert a.record_merge_failures([lone], []) == set()
+            assert a.load_retry()["pending"] == {lone.item_id: 1}
     finally:
         a.merge_checked = real
 
