@@ -560,14 +560,23 @@ def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Ite
     in October 2026). The day loop already starts at the watermark day, and
     write_archive drops any URL that is already archived, so re-reading the watermark
     day costs nothing. `publishedAt` is kept on the item for attribution.
+
+    Raises:
+        RuntimeError: when any listing day failed. Swallowing the error let main()
+            advance the watermark past that day, so a day that returned 503 was never
+            fetched again. Raising holds the watermark, as fetch_hn does; the good
+            days' papers are refetched next run.
     """
     items: list[Item] = []
+    failed: list[str] = []
     today = datetime.now(timezone.utc).date()
     day = max(since.date(), today - timedelta(days=LOOKBACK_CAP_DAYS))
     while day <= today:
         try:
             data = json.loads(http_get(f"{url}?date={day.isoformat()}"))
-        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError):
+        except (urllib.error.HTTPError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            log(f"  WARN hf papers {day.isoformat()}: {type(exc).__name__}")
+            failed.append(day.isoformat())
             day += timedelta(days=1)
             continue
         for entry in data:
@@ -582,6 +591,8 @@ def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Ite
                 strip_html(paper.get("summary") or entry.get("summary") or "")[:MAX_BODY_CHARS],
             ))
         day += timedelta(days=1)
+    if failed:
+        raise RuntimeError(f"{len(failed)} listing day(s) failed ({', '.join(failed)})")
     return items
 
 
