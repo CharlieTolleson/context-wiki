@@ -246,6 +246,18 @@ def test_write_archive_dedupes_within_a_batch_and_reoffers_unmerged():
         assert len(ids) == len(set(ids)) == 4                      # no second copy of anything
 
 
+def test_write_archive_reoffer_keeps_the_archived_full_body():
+    """A re-offered item whose refetch is thin carries the archived full text, not the teaser."""
+    with sandbox() as tmp:
+        full = "Full article text. " * 50
+        A = item("sw", "https://x/a"); A.body = full
+        a.write_archive([A], "2026-10-01")                           # archived, never merged
+        A2 = item("sw", "https://x/a"); A2.body = "teaser"
+        a.write_archive([A2], "2026-10-02")
+        assert A2.item_id == "2026-10-01-sw-01"                    # original id reused
+        assert A2.body == full.strip()                             # archived body, not the teaser
+
+
 # ── git commit scoping ──────────────────────────────────────────────────────
 
 
@@ -1193,6 +1205,30 @@ def test_hf_papers_keeps_papers_listed_today_but_published_earlier():
     assert [it.url for it in items] == ["https://huggingface.co/papers/2510.01234"]
     assert items[0].published == published                  # publishedAt is kept for attribution
     assert items[0].body == "abstract"
+
+
+def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
+    """One listing day that errors raises naming that day (main() then holds the watermark)."""
+    import urllib.error
+
+    since = datetime.now(timezone.utc) - timedelta(days=2)
+    bad_day = (since + timedelta(days=1)).date().isoformat()
+
+    def flaky(url: str) -> bytes:
+        if url.endswith("date=" + bad_day):
+            raise urllib.error.HTTPError(url, 503, "Service Unavailable", None, None)
+        return b"[]"
+
+    real = a.http_get
+    a.http_get = flaky
+    try:
+        try:
+            a.fetch_hf_papers("hf-daily-papers", "hf", "https://example/api/daily_papers", since)
+            raise AssertionError("expected a RuntimeError")
+        except RuntimeError as exc:
+            assert bad_day in str(exc)
+    finally:
+        a.http_get = real
 
 
 if __name__ == "__main__":
