@@ -252,6 +252,7 @@ class Item:
     published: datetime
     body: str
     item_id: str = ""
+    revived: bool = False   # archived by an earlier run that never merged it (write_archive)
 
 
 def log(msg: str) -> None:
@@ -646,6 +647,16 @@ def archived_urls() -> set[str]:
     return urls
 
 
+def finished_urls() -> set[str]:
+    """Archived URLs whose item a merge has already seen (cited or marked reviewed).
+
+    An archived URL that no merge has seen yet (its chunk failed, or a quota held it back)
+    is left out, so a URL-novelty source fetches it again and write_archive re-offers it.
+    """
+    done = merged_ids()
+    return {it.url for it in read_archive() if it.url and it.item_id in done}
+
+
 def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[Item]:
     """Scrape a link-index page whose articles have no feed.
 
@@ -654,11 +665,15 @@ def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[It
     retrieval), and most of it predates any sensible lookback window. The
     watermark would exclude exactly the material we most want. Real publication
     dates are still scraped per-article for attribution.
+
+    Only URLs a merge has already seen are skipped. Skipping every archived URL meant an
+    article whose merge chunk failed was never offered again (holding the watermark does
+    nothing for a source that ignores it).
     """
     base = "https://www.anthropic.com"
     index_html = http_get(url).decode("utf-8", errors="replace")
     slugs = sorted(set(INDEX_LINK_RE.findall(index_html)))
-    already = archived_urls()
+    already = finished_urls()
 
     # The index lists a date beside each link; that is more reliable than
     # scraping the article page, where some posts carry no date at all and the
@@ -938,6 +953,7 @@ def write_archive(items: list[Item], run_date: str) -> Path:
                 old = existing_ids.get(i.url)
                 if old and old not in done:
                     i.item_id = old
+                    i.revived = True
                     revived += 1
                 continue  # never append a second copy
         fresh.append(i)
@@ -1370,9 +1386,13 @@ def select_for_merge(items: list[Item]) -> list[Item]:
     MAX_MERGE_ITEMS. A normal day's fetch is 10 to 30 items plus 20 to 50 papers,
     so a quota that only kicked in above the batch cap let papers flood exactly
     the batches the daily run produces. Items a quota drops stay archived.
+
+    Within a source, re-offered items (revived) go first, then newest first. A re-offered
+    item is one an earlier run failed to merge; ranking it by date alone let fresh items
+    push it past the quota, and its source's watermark then advanced without it.
     """
     buckets: dict[str, list[Item]] = {}
-    for it in sorted(items, key=lambda i: i.published, reverse=True):
+    for it in sorted(items, key=lambda i: (i.revived, i.published), reverse=True):
         buckets.setdefault(it.source, []).append(it)
     # Apply per-source quotas before round-robin so a high-volume source cannot
     # dominate the batch even when other sources are quiet.
@@ -2381,7 +2401,7 @@ def main() -> int:
     held = hold_watermarks(state, new_state, merge_items, merged_items)
     if held:
         log(f"WARN watermark held for {', '.join(held)}: a merge chunk with their items failed, "
-            "so the next run refetches them and write_archive re-offers them")
+            "so the next run refetches them and write_archive re-offers them ahead of new items")
 
     updated = prune_to_cap(updated, creds)
     write_wiki(updated)

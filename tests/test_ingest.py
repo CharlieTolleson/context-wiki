@@ -462,14 +462,14 @@ def test_html_index_dates_bind_to_their_own_card():
     assert {p: d.date().isoformat() for p, d in got.items()} == {p: iso for p, _, _, iso in cards}
 
     # and through the fetcher, with the network stubbed and an empty archive
-    real_get, real_archived = a.http_get, a.archived_urls
-    a.http_get, a.archived_urls = fake_get, lambda: set()
+    real_get = a.http_get
+    a.http_get = fake_get
     try:
         with sandbox():
             items = a.fetch_html_index("anthropic-eng", "ae", "https://www.anthropic.com/engineering",
                                        datetime(2000, 1, 1, tzinfo=timezone.utc))
     finally:
-        a.http_get, a.archived_urls = real_get, real_archived
+        a.http_get = real_get
     by_url = {i.url: i for i in items}
     assert len(by_url) == 3
     for p, title, _, iso in cards:
@@ -775,6 +775,28 @@ def test_hold_watermarks_keeps_old_watermark_for_sources_in_a_failed_chunk():
     assert held == ["blog", "newsrc"]                     # hn-radar has no watermark to hold
     assert new_state == {"blog": state["blog"], "feed": "NOW"}
 
+
+
+def test_html_index_refetches_archived_urls_no_merge_has_seen():
+    """An archived but unmerged corpus article is fetched again; a cited or reviewed one is not."""
+    with sandbox():
+        when = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        pending, cited, reviewed = (a.Item("anthropic-eng", "ae", t, f"https://www.anthropic.com/engineering/{t}",
+                                           when, "body") for t in ("pending", "cited", "reviewed"))
+        a.write_archive([pending, cited, reviewed], "2026-01-01")
+        a.INDEX_PATH.write_text(f"## S\n\n- a practice - anthropic-eng, 2026-01-01 [{cited.item_id}]\n")
+        a.mark_reviewed([reviewed.item_id])
+        assert a.finished_urls() == {cited.url, reviewed.url}
+
+
+def test_select_for_merge_puts_reoffered_items_ahead_of_new_ones_within_quota():
+    """A paper re-offered after a failed chunk is not pushed past the quota by newer papers."""
+    now = datetime.now(timezone.utc)
+    fresh = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(hours=n), "b")
+             for n in range(5)]
+    old = a.Item("hf-daily-papers", "hf", "old", "https://x/old", now - timedelta(days=3), "b", revived=True)
+    picked = a.select_for_merge(fresh + [old])
+    assert old in picked and len(picked) == a.SOURCE_QUOTA["hf-daily-papers"]
 
 def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
     """Items go to the model MERGE_CHUNK at a time; a rejected chunk is skipped, the rest still land."""
