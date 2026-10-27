@@ -916,7 +916,7 @@ def write_archive(items: list[Item], run_date: str) -> Path:
     """
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
     known = archived_urls()
-    existing_ids: dict[str, str] | None = None
+    archived: dict[str, Item] | None = None
     done: set[str] = set()
     fresh: list[Item] = []
     seen_in_batch: set[str] = set()
@@ -932,12 +932,18 @@ def write_archive(items: list[Item], run_date: str) -> Path:
                 # Archived by an earlier run. If that run never merged it (the merge
                 # failed or was rejected), reuse its id so it is merged now instead of
                 # being skipped forever. Otherwise it is finished and is skipped.
-                if existing_ids is None:
-                    existing_ids = {a.url: a.item_id for a in read_archive() if a.url}
+                if archived is None:
+                    archived = {a.url: a for a in read_archive() if a.url}
                     done = merged_ids()
-                old = existing_ids.get(i.url)
-                if old and old not in done:
-                    i.item_id = old
+                prev = archived.get(i.url)
+                if prev and prev.item_id not in done:
+                    i.item_id = prev.item_id
+                    # The refetch usually carries only the feed's title or teaser, and
+                    # enrich_thin skips archived URLs, so without this the merge would see
+                    # the thin body, reject it, and the archived full text would never be used.
+                    if (len(prev.body) > len(i.body or "")
+                            and not prev.body.startswith(NO_BODY_PLACEHOLDER)):
+                        i.body = prev.body
                     revived += 1
                 continue  # never append a second copy
         fresh.append(i)

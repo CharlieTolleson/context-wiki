@@ -245,6 +245,18 @@ def test_write_archive_dedupes_within_a_batch_and_reoffers_unmerged():
         assert len(ids) == len(set(ids)) == 4                      # no second copy of anything
 
 
+def test_write_archive_reoffer_keeps_the_archived_full_body():
+    """A re-offered item whose refetch is thin carries the archived full text, not the teaser."""
+    with sandbox() as tmp:
+        full = "Full article text. " * 50
+        A = item("sw", "https://x/a"); A.body = full
+        a.write_archive([A], "2026-10-01")                           # archived, never merged
+        A2 = item("sw", "https://x/a"); A2.body = "teaser"
+        a.write_archive([A2], "2026-10-02")
+        assert A2.item_id == "2026-10-01-sw-01"                    # original id reused
+        assert A2.body == full.strip()                             # archived body, not the teaser
+
+
 # ── git commit scoping ──────────────────────────────────────────────────────
 
 
