@@ -1166,6 +1166,22 @@ def test_radar_picks_accept_python_style_and_quoted_number_replies():
     assert a.parse_radar_picks("[]", cands) == []
 
 
+def test_radar_picks_prefer_the_number_answer_over_quoted_terms():
+    """Candidate terms quoted before the answer are not picks; an explicit [] means none."""
+    cands = _radar_cands("codemode", "france", "tool search")
+    raw = 'Of ["codemode", "france", "tool search"], the techniques are: [0, 2]'
+    assert [c.term for c in a.parse_radar_picks(raw, cands)] == ["codemode", "tool search"]
+    assert a.parse_radar_picks('Candidates: ["codemode", "france"]. None qualify: []', cands) == []
+    assert [c.term for c in a.parse_radar_picks('maybe ["france"]? final: ["codemode"]', cands)] == ["codemode"]
+
+
+def test_radar_picks_survive_odd_digits():
+    """A superscript digit or a huge number is skipped, not an exception that drops the filter."""
+    cands = _radar_cands("codemode", "france")
+    assert a.parse_radar_picks('["\u00b2"]', cands) == []
+    assert [c.term for c in a.parse_radar_picks("[" + "9" * 5000 + "] [0]", cands)] == ["codemode"]
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0

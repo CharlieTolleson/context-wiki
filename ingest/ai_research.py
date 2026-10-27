@@ -1068,48 +1068,65 @@ def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.C
         cands: the candidates the prompt listed, in prompt order.
 
     Returns:
-        Up to 8 picked candidates from the first array in the reply that names any, de-duplicated
-        in reply order; [] when arrays parse but name none; None when the reply holds no
-        parseable array (the caller logs that as a filter failure).
+        Up to 8 picked candidates, de-duplicated in reply order, from the last array of
+        numbers or, when there is none, the last array that names a candidate; [] when arrays
+        parse but name none; None when the reply holds no parseable array (the caller logs
+        that as a filter failure).
     """
     by_term = {c.term.lower(): c for c in cands}
 
-    def pick(v: object) -> "radar.Candidate | None":
+    def as_number(v: object) -> int | None:
         if isinstance(v, str):
             v = v.strip().strip("'\"").strip()
-            if v.isdigit():
-                v = int(v)      # ["0", "2"] means numbers, not terms
-            else:
-                return by_term.get(v.lower())
+            # isascii: "²".isdigit() is True but int("²") raises; the length cap keeps int()
+            # clear of Python's digit limit, and no candidate list is that long anyway.
+            if not (v.isascii() and v.isdigit() and len(v) <= 6):
+                return None
+            v = int(v)      # ["0", "2"] means numbers, not terms
         # bool is an int subclass; json never yields True for a number, but be explicit.
-        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < len(cands):
-            return cands[v]
-        return None
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
 
-    # Take the first array that yields a pick, not the first bracket: a reply that thinks
-    # aloud ("maybe [codemode]?") or cites "[notes]" before its answer would otherwise fail.
-    parsed_any = False
+    def pick(v: object) -> "radar.Candidate | None":
+        n = as_number(v)
+        if n is not None:
+            return cands[n] if 0 <= n < len(cands) else None
+        return by_term.get(v.strip().strip("'\"").strip().lower()) if isinstance(v, str) else None
+
+    # Every bracket is tried, not only the first: a reply that thinks aloud ("maybe
+    # [codemode]?") or cites "[notes]" before its answer would otherwise fail. An array of
+    # numbers is the format asked for, so the last one wins (including "[]", none qualify)
+    # even when the reply quotes candidate terms earlier; only a reply with no number array
+    # is read as terms, and then the last array that names a candidate is the answer.
+    arrays: list[list] = []
     for found in re.finditer(r"\[[^\[\]]*\]", raw):
         try:
             values = json.loads(found.group(0))
-        except json.JSONDecodeError:
+        except ValueError:      # JSONDecodeError, or an int past the digit limit
             try:
                 values = ast.literal_eval(found.group(0))   # a Python-style ['vllm', 'codemode']
-            except (ValueError, SyntaxError):
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
                 continue
-        if not isinstance(values, list):
-            continue
-        parsed_any = True
-        picked: list["radar.Candidate"] = []
+        if isinstance(values, list):
+            arrays.append(values)
+    if not arrays:
+        return None
+
+    def picks(values: list) -> list["radar.Candidate"]:
+        out: list["radar.Candidate"] = []
         for v in values:
             c = pick(v)
-            if c is not None and c not in picked:
-                picked.append(c)
-        if picked:
-            return picked[:8]
-        if values:
-            log(f"NOTE radar filter reply array matched no candidate: {found.group(0)[:80]!r}")
-    return [] if parsed_any else None
+            if c is not None and c not in out:
+                out.append(c)
+        return out[:8]
+
+    numeric = [v for v in arrays if all(as_number(x) is not None for x in v)]
+    if numeric:
+        return picks(numeric[-1])
+    for values in reversed(arrays):
+        if picked := picks(values):
+            return picked
+    log(f"NOTE radar filter reply arrays matched no candidate: {raw[:80]!r}")
+    return []
 
 
 def radar_scan(wiki_text: str, creds: dict[str, str] | None) -> RadarReport:
