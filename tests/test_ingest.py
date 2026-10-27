@@ -202,6 +202,47 @@ def test_merge_index_drops_trailing_prose_that_holds_its_own_fence():
     assert _merge_reply(f"```markdown\n{wiki}\n```\nChanges:\n```diff\n+ x\n```") == wiki
 
 
+def test_unwrap_keeps_an_unfenced_wiki_that_opens_with_a_code_block():
+    """A leading bare block (or a ```markdown example after a line of prose) is not a wrapper."""
+    wiki = "# M\n\n## S\n" + "".join(f"- c{i} [2026-01-01-ab-0{i}]\n" for i in range(5))
+    reply = "```\npip install foo\n```\n" + wiki
+    assert a.unwrap_reply(reply) == reply.strip()
+    reply = "Intro.\n```markdown\n# P\n- run tests\n```\n" + wiki
+    assert a.unwrap_reply(reply) == reply.strip()
+
+
+def test_unwrap_does_not_cut_the_last_section_at_a_bare_inner_block():
+    """Claims after a bare inner block keep the wrapper open, whatever their bullet or heading style."""
+    wiki = ("# M\n\n## Tools\n\n- one [2026-01-01-ab-01]\n  ```\n  cfg\n  ```\n"
+            "  - nested [2026-01-01-ab-02]\n* star [2026-01-01-ab-03]\n### Sub\nText")
+    assert a.unwrap_reply(f"```markdown\n{wiki}\n```") == wiki
+    wiki = "## S\n- one [2026-01-01-ab-01]\n```\nx=1\n```\n- uncited bullet"
+    assert a.unwrap_reply(f"```markdown\n{wiki}\n```") == wiki
+
+
+def test_unwrap_drops_trailing_prose_with_a_bare_fence_pair():
+    """Prose after the wrapper that holds its own bare block is dropped, inner bare blocks are kept."""
+    wiki = "## S\n\n- one [2026-01-01-ab-01]\n\n```\nx=1\n```\n\n- two [2026-01-01-ab-02]"
+    assert a.unwrap_reply(f"```markdown\n{wiki}\n```\nNotes:\n```\nchanged 2 lines\n```") == wiki
+
+
+def test_unwrap_handles_tilde_long_and_uppercase_fences_and_crlf():
+    wiki = "## S\n\n- one [2026-01-01-ab-01]\n- two [2026-01-01-ab-02]"
+    assert a.unwrap_reply(f"~~~markdown\n{wiki}\n~~~\nLet me know.") == wiki
+    inner = f"{wiki}\n```python\nx\n```"
+    assert a.unwrap_reply(f"````markdown\n{inner}\n````\nThanks") == inner
+    assert a.unwrap_reply(f"```Markdown\n{wiki}\n```\nBye") == wiki
+    assert a.unwrap_reply(f"```md\n{wiki}\n```\nBye".replace("\n", "\r\n")) == wiki
+    assert a.unwrap_reply(f"```markdown\n{wiki}") == wiki          # unclosed wrapper
+
+
+def test_unwrap_keeps_the_closing_fence_of_a_trailing_code_block():
+    """An unfenced wiki ending in a code block keeps that block's closing fence."""
+    wiki = "## S\n\n- one [2026-01-01-ab-01]\n\n```\nx=1\n```"
+    assert a.unwrap_reply(wiki) == wiki
+    assert a.unwrap_reply(wiki + "\n```") == wiki                  # a lone stray fence goes
+
+
 def test_merge_index_finish_reason_none_or_max_tokens():
     """None is a normal reply; the Anthropic spelling of a cut reply is discarded too."""
     wiki = doc(9)

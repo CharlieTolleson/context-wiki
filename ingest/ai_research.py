@@ -1476,7 +1476,66 @@ def merge_index(index_md: str, items: list[Item], creds: dict[str, str],
     return unwrap_reply((resp.choices[0].message.content or "").strip())
 
 
-FENCE_LINE_RE = re.compile(r"^[ \t]*```[ \t]*([\w+-]*)[ \t]*$", re.M)
+# A fence line: three or more backticks or tildes, then an optional info string.
+FENCE_LINE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})[ \t]*([^\n`]*?)[ \t]*$", re.M)
+# Lines count_claims and the section parser treat as wiki structure.
+STRUCTURE_RE = re.compile(r"^\s*(#{1,6} |[-*] )", re.M)
+
+
+def _info(f: re.Match) -> str:
+    return f.group(2).lower()
+
+
+def _closes(f: re.Match, opener: re.Match) -> bool:
+    """A fence closes a block only with the same character, at least the same length, and no info string."""
+    return f.group(1)[0] == opener.group(1)[0] and len(f.group(1)) >= len(opener.group(1)) and not f.group(2)
+
+
+def _wrapper_close(out: str, opening: re.Match, fences: list[re.Match]) -> re.Match | None:
+    """The fence that closes the wrapper, or None when the reply is not wrapped after all.
+
+    Any fence at the wrapper's top level may be its close or the start of a bare inner block,
+    so each is a candidate unless it is indented deeper than the opening. The first candidate
+    with no wiki structure after it wins, so prose after the wiki may hold its own code block
+    but a claim, heading, or bullet after a bare inner block keeps the wrapper open.
+    """
+    def indent(f: re.Match) -> int:
+        return len(f.group(0)) - len(f.group(0).lstrip())
+
+    inner = None
+    for f in fences[fences.index(opening) + 1:]:
+        if inner is not None:
+            if _closes(f, inner):
+                inner = None
+            continue
+        inner = f       # if it does not close the wrapper, it opens an inner block
+        if not _closes(f, opening) or indent(f) > indent(opening):
+            continue
+        if not STRUCTURE_RE.search(out[f.end():]):
+            return f
+    return None
+
+
+def _strip_outer(out: str, fences: list[re.Match]) -> str:
+    """Strip only a fence pair around the whole reply, an unclosed opening, or a stray last fence."""
+    if not fences:
+        return out
+    first, last, opener, pair = fences[0], fences[-1], None, None
+    for f in fences:
+        if opener is None:
+            opener = f
+        elif _closes(f, opener):
+            if opener is first:
+                pair = f
+            opener = None
+    wrap = first.start() == 0 and _info(first) in ("", "markdown", "md")
+    if wrap and pair is last and last.end() == len(out):
+        return out[first.end():last.start()].strip()
+    if wrap and opener is first:                           # an opening that never closes
+        return out[first.end():].strip()
+    if opener is last and last.end() == len(out):          # a lone fence on the last line
+        return out[:last.start()].strip()
+    return out
 
 
 def unwrap_reply(out: str) -> str:
@@ -1485,34 +1544,26 @@ def unwrap_reply(out: str) -> str:
     Models sometimes wrap the wiki in a fence and add prose after it ("Let me know if...");
     stripping a fence only at the very ends stored that chatter in the wiki. A fence counts as
     the wrapper only when the reply opens with it or with a few lines of prose that hold no
-    heading or bullet, so a ```markdown example inside an unfenced wiki is never taken for
-    one. The wrapper closes at the first bare ``` that does not close an inner ```lang block;
-    if a heading or a cited claim still follows that line, it was a bare inner block, so the
-    last fence closes instead.
+    heading or bullet, its info string is empty or markdown, and a matching close leaves no
+    wiki structure behind it (see _wrapper_close). Otherwise the reply is not wrapped, so a
+    leading code block or a ```markdown example inside an unfenced wiki is never taken for one.
+    If unwrapping still loses a claim, the conservative form is returned instead.
     """
+    out = out.replace("\r\n", "\n").strip()
     fences = list(FENCE_LINE_RE.finditer(out))
-    opening = fences[0] if fences else None
-    if opening and opening.group(1) not in ("", "markdown", "md"):
-        opening = None
+    opening = fences[0] if fences and _info(fences[0]) in ("", "markdown", "md") else None
     if opening and opening.start() > 0:
         before = [ln for ln in out[:opening.start()].splitlines() if ln.strip()]
         if len(before) > 2 or any(re.match(r"\s*(#|[-*] )", ln) for ln in before):
             opening = None
-    if not opening:
-        return re.sub(r"^```(?:markdown)?\s*|\s*```$", "", out).strip()  # strip stray fences
-    body_start = opening.end() + 1
-    inner, close = False, None
-    for f in fences[1:]:
-        if f.group(1):
-            inner = True
-        elif inner:
-            inner = False
-        else:
-            close = f
-            break
-    if close and re.search(r"^(## |- .*\[\d{4}-\d{2}-\d{2}-)", out[close.end():], re.M):
-        close = fences[-1] if fences[-1] is not opening else None
-    return (out[body_start:close.start()] if close else out[body_start:]).strip()
+    close = _wrapper_close(out, opening, fences) if opening else None
+    conservative = _strip_outer(out, fences)
+    if not close:
+        return conservative
+    wiki = out[opening.end():close.start()].strip()
+    if count_claims(wiki) < count_claims(out):
+        return conservative
+    return wiki
 
 
 # ── Shrink guard ────────────────────────────────────────────────────────────
