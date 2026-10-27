@@ -1131,6 +1131,30 @@ def test_hf_papers_keeps_papers_listed_today_but_published_earlier():
     assert items[0].body == "abstract"
 
 
+def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
+    """One listing day that errors raises naming that day (main() then holds the watermark)."""
+    import urllib.error
+
+    since = datetime.now(timezone.utc) - timedelta(days=2)
+    bad_day = (since + timedelta(days=1)).date().isoformat()
+
+    def flaky(url: str) -> bytes:
+        if url.endswith("date=" + bad_day):
+            raise urllib.error.HTTPError(url, 503, "Service Unavailable", None, None)
+        return b"[]"
+
+    real = a.http_get
+    a.http_get = flaky
+    try:
+        try:
+            a.fetch_hf_papers("hf-daily-papers", "hf", "https://example/api/daily_papers", since)
+            raise AssertionError("expected a RuntimeError")
+        except RuntimeError as exc:
+            assert bad_day in str(exc)
+    finally:
+        a.http_get = real
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
