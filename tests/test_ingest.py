@@ -2198,7 +2198,6 @@ def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
         a.http_get = real
 
 
-
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
