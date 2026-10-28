@@ -45,7 +45,7 @@ import ai_research as a  # noqa: E402
 import radar  # noqa: E402
 
 PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT",
-              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "RETRY_PATH")
+              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "LOCK_PATH", "RETRY_PATH")
 
 
 @contextlib.contextmanager
@@ -65,6 +65,7 @@ def sandbox():
     a.RECALL_PATH = tmp / "ingest" / "RECALL.md"
     a.RETRY_PATH = tmp / "ingest" / "merge_retry.json"
     a.WATCHLIST_PATH = tmp / "watchlist.txt"      # absent unless a test writes one
+    a.LOCK_PATH = tmp / "ingest" / "run.lock"
     (tmp / "ingest").mkdir()
     try:
         yield tmp
@@ -518,6 +519,134 @@ def test_write_archive_dedupes_within_a_batch_and_reoffers_unmerged():
         assert C3.item_id == "2026-10-02-ls-01"                    # new: archived
         ids = [i.item_id for i in a.read_archive()]
         assert len(ids) == len(set(ids)) == 4                      # no second copy of anything
+
+
+def test_atomic_write_keeps_the_old_file_when_the_write_fails_partway():
+    """A failure after some bytes are written leaves the old file whole and no temp file behind."""
+    with sandbox() as tmp:
+        target = tmp / "INDEX.md"
+        target.write_text("old wiki\n")
+        real = os.fsync
+
+        def disk_full(fd):
+            raise OSError(28, "No space left on device")
+
+        os.fsync = disk_full
+        try:
+            a.atomic_write(target, "new wiki that never fully lands\n")
+            raise AssertionError("the failed write did not raise")
+        except OSError:
+            pass
+        finally:
+            os.fsync = real
+        assert target.read_text() == "old wiki\n"
+        assert sorted(p.name for p in tmp.iterdir()) == ["INDEX.md", "ingest"]
+        a.atomic_write(tmp / "state" / "state.json", "{}\n")     # a missing parent dir is created
+        assert (tmp / "state" / "state.json").read_text() == "{}\n"
+
+
+def _lock_is_free() -> bool:
+    """Try the run lock from a separate descriptor, as a second process would."""
+    import fcntl
+    fd = os.open(a.LOCK_PATH, os.O_RDWR | os.O_CREAT)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def test_atomic_write_writes_through_a_symlink():
+    """A symlinked INDEX.md keeps its link; the file it points at gets the new text."""
+    with sandbox() as tmp:
+        real = tmp / "elsewhere"
+        real.mkdir()
+        (real / "INDEX.md").write_text("old\n")
+        (tmp / "INDEX.md").symlink_to(real / "INDEX.md")
+        a.atomic_write(tmp / "INDEX.md", "new\n")
+        assert (tmp / "INDEX.md").is_symlink()
+        assert (real / "INDEX.md").read_text() == "new\n"
+
+
+def test_atomic_write_honours_the_umask_and_keeps_an_existing_mode():
+    """A new file gets 0666 less the umask, as write_text gave it; an existing file keeps its mode."""
+    with sandbox() as tmp:
+        old = os.umask(0o077)
+        try:
+            a.atomic_write(tmp / "new.md", "x\n")
+        finally:
+            os.umask(old)
+        assert (tmp / "new.md").stat().st_mode & 0o777 == 0o600
+        (tmp / "kept.md").write_text("x\n")
+        os.chmod(tmp / "kept.md", 0o640)
+        a.atomic_write(tmp / "kept.md", "y\n")
+        assert (tmp / "kept.md").stat().st_mode & 0o777 == 0o640
+
+
+def test_run_lock_sweeps_temp_files_left_by_a_killed_run():
+    """An orphaned atomic_write temp file is removed before it can be committed; real files stay."""
+    with sandbox() as tmp:
+        a.ARCHIVE_DIR.mkdir()
+        orphan = a.ARCHIVE_DIR / ".ctxwiki.2026-10-27.md.k3j2.tmp"
+        orphan.write_text("half")
+        keep = a.ARCHIVE_DIR / "2026-10-27.md"
+        keep.write_text("# Archive\n")
+        (tmp / ".ctxwiki.INDEX.md.abcd.tmp").write_text("half")
+        with a.run_lock():
+            pass
+        assert not orphan.exists() and not (tmp / ".ctxwiki.INDEX.md.abcd.tmp").exists() and keep.exists()
+
+
+def test_run_lock_sweep_leaves_other_tools_temp_files_alone():
+    """WIKI_DIR may be a vault folder: Syncthing's and the user's own .tmp files survive the sweep."""
+    with sandbox() as tmp:
+        foreign = [tmp / ".syncthing.Note.md.tmp", tmp / ".draft.tmp"]
+        for f in foreign:
+            f.write_text("not ours")
+        with a.run_lock():
+            pass
+        assert all(f.exists() for f in foreign)
+
+
+def test_run_lock_gives_up_after_the_wait_bound_and_names_the_holder():
+    """A lock held past LOCK_WAIT_SECONDS ends the run with exit 1 and the holder's PID in the log."""
+    import fcntl
+    with sandbox():
+        fd = os.open(a.LOCK_PATH, os.O_RDWR | os.O_CREAT)
+        os.write(fd, b"4242\n")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        saved = a.LOCK_WAIT_SECONDS, a.LOCK_POLL_SECONDS, a.log
+        lines: list[str] = []
+        a.LOCK_WAIT_SECONDS, a.LOCK_POLL_SECONDS, a.log = 0, 0, lines.append
+        try:
+            with a.run_lock():
+                raise AssertionError("the lock was taken while another run held it")
+        except SystemExit as exc:
+            assert exc.code == 1
+        finally:
+            a.LOCK_WAIT_SECONDS, a.LOCK_POLL_SECONDS, a.log = saved
+            os.close(fd)
+        assert "pid 4242" in lines[0] and lines[-1].startswith("ERROR")
+        with a.run_lock():                                          # free again: the holder's PID is ours now
+            assert a.LOCK_PATH.read_text() == f"{os.getpid()}\n"
+
+
+def test_writing_modes_hold_the_run_lock_and_release_it_after():
+    """--add-url runs under the lock (a second run would have to wait); it is freed afterwards."""
+    with sandbox():
+        seen = []
+        saved = a.add_manual, a.load_env, sys.argv
+        a.add_manual = lambda *args: seen.append(_lock_is_free()) or 0
+        a.load_env = lambda: {}
+        sys.argv = ["ai_research.py", "--add-url", "https://example.com/post"]
+        try:
+            assert a.main() == 0
+        finally:
+            a.add_manual, a.load_env, sys.argv = saved
+        assert seen == [False]                                      # held while the mode ran
+        assert _lock_is_free()                                      # released when it returned
 
 
 def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():

@@ -44,6 +44,8 @@ from __future__ import annotations
 import argparse
 import ast
 import collections
+import contextlib
+import fcntl
 import html
 import ipaddress
 import json
@@ -53,6 +55,8 @@ import re
 import socket
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -123,6 +127,11 @@ MAX_MERGE_FAILURES = 2   # failures in a chunk of its own before an item is give
 MAX_SOLO_MERGES = 4      # earlier failures merged one per call in a run; see plan_chunks
 DROPPED_PATH = STATE_DIR / "dropped_claims.jsonl"   # every claim a merge removed, for the recall report
 RECALL_PATH = STATE_DIR / "RECALL.md"               # latest coverage report (local, regenerated each run)
+# Held for the whole of any run that writes, so the daily job and a manual run never interleave.
+LOCK_PATH = STATE_DIR / "run.lock"
+# atomic_write temp files start with this, so the orphan sweep and a vault .gitignore can match
+# ours alone: WIKI_DIR is often a vault folder that other tools (Syncthing, editors) also use.
+TEMP_PREFIX = ".ctxwiki."
 # Optional separate file for the endpoint credentials, so secrets can live in one shared place.
 ENV_PATH = Path(setting("WIKI_ENV_FILE", str(LOCAL_ENV))).expanduser()
 # Concepts that must be covered; see radar.parse_watchlist for the format.
@@ -142,6 +151,9 @@ MERGE_CHUNK = 15         # items per LLM call. 60 in one prompt made gpt-4o rewr
 MAX_BACKFILL_PASSES = 8  # bound a backfill; quota-capped sources would otherwise
                          # need ~50 passes to drain, one LLM call each
 HTTP_TIMEOUT = 45
+LOCK_WAIT_SECONDS = 2 * 60 * 60  # give up on the run lock after this; a stuck manual run would otherwise
+                                 # make every scheduled run queue behind it silently for days
+LOCK_POLL_SECONDS = 5    # how often a waiting run retries the lock
 RADAR_WINDOW_DAYS = 21   # "recent" for emerging-term detection; older archive is the baseline
 RADAR_MODEL = setting("WIKI_RADAR_MODEL", "cheap")   # small model: filters candidate terms, never writes the wiki
 RADAR_SEARCH_TERMS = 8   # max terms per run sent to targeted Hacker News search
@@ -891,9 +903,61 @@ def _stub(title: str, slug: str, body: str) -> str:
     )
 
 
+def atomic_write(path: Path, text: str) -> None:
+    """Replace path with text so a reader only ever sees the old file or the new one.
+
+    write_text truncates first, so a kill or a full disk mid-write left a cut-off INDEX.md,
+    state.json or archive day. A cut-off INDEX.md is worse than a lost write: it becomes the
+    next merge's input and the shrink guard measures against it. The temp file lives in the
+    same directory because os.replace is only atomic within one filesystem.
+
+    A symlink is followed and its target replaced, as write_text did; replacing the path
+    itself would swap the link for a regular file and cut it off from what it pointed at.
+    """
+    if path.is_symlink():
+        path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f"{TEMP_PREFIX}{path.name}.", suffix=".tmp")
+    try:
+        # mkstemp creates the file 0600. Keep the mode an existing file had; give a new one
+        # 0666 less the umask, as write_text would. os.umask can only be read by setting it.
+        if path.exists():
+            mode = path.stat().st_mode & 0o777
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            mode = 0o666 & ~umask
+        os.chmod(tmp, mode)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def sweep_temp_files() -> None:
+    """Delete atomic_write temp files left by a run that was killed mid-write.
+
+    The cleanup in atomic_write does not run on SIGKILL, or on the SIGTERM launchd sends on
+    unload, and commit() stages ARCHIVE_DIR and TOPICS_DIR whole, so an orphan would be
+    committed and kept forever. Called with the run lock held, so no live write is touched.
+    Only TEMP_PREFIX files are matched: WIKI_DIR may be a vault folder, and a broader
+    pattern deleted other tools' in-flight temp files (Syncthing's .syncthing.*.tmp, say).
+    """
+    for folder in {WIKI_DIR, TOPICS_DIR, ARCHIVE_DIR, STATE_DIR}:
+        for tmp in folder.glob(f"{TEMP_PREFIX}*.tmp") if folder.is_dir() else ():
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+                log(f"removed {tmp.name}, left by an interrupted run")
+
+
 def _write_if_changed(path: Path, text: str) -> None:
     if not path.exists() or path.read_text() != text:
-        path.write_text(text)
+        atomic_write(path, text)
 
 
 def write_wiki(md: str) -> None:
@@ -1048,7 +1112,7 @@ def write_archive(items: list[Item], run_date: str) -> Path:
             f"- published: {it.published.isoformat()}\n\n"
             f"{archive_body(it.body) if it.body else '(no body in feed; fetch the url for full text)'}\n"
         )
-    path.write_text(existing + "".join(blocks))
+    atomic_write(path, existing + "".join(blocks))
     return path
 
 
@@ -1355,8 +1419,7 @@ def write_recall(wiki_text: str, report: RadarReport) -> None:
     if drops:
         out.append("\n## Claims removed by merges in the last 14 days (check none was a loss)")
         out += [f"- {d['date']}: {d['claim'][:220]}" for d in drops]
-    RECALL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RECALL_PATH.write_text("\n".join(out) + "\n")
+    atomic_write(RECALL_PATH, "\n".join(out) + "\n")
     log(f"RECALL watchlist missing: {[e[0] for e in report.missing] or 'none'}; "
         f"emerging: {[c.term for c in report.emerging] or 'none'}; claims dropped (14d): {len(drops)}")
 
@@ -1368,8 +1431,7 @@ def mark_reviewed(ids: Iterable[str]) -> None:
     except (json.JSONDecodeError, OSError):
         reviewed = set()
     reviewed.update(i for i in ids if i)
-    REVIEWED_PATH.parent.mkdir(parents=True, exist_ok=True)
-    REVIEWED_PATH.write_text(json.dumps(sorted(reviewed)) + "\n")
+    atomic_write(REVIEWED_PATH, json.dumps(sorted(reviewed)) + "\n")
 
 
 # ── Merge ───────────────────────────────────────────────────────────────────
@@ -2261,7 +2323,7 @@ def record_merge_failures(offered: list[Item], merged: list[Item]) -> set[str]:
             f"(left for --backfill): {', '.join(sorted(gave_up))[:200]}")
     retry["gave_up"] = sorted(set(retry["gave_up"]) | gave_up)
     RETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    RETRY_PATH.write_text(json.dumps(retry, indent=2, sort_keys=True) + "\n")
+    atomic_write(RETRY_PATH, json.dumps(retry, indent=2, sort_keys=True) + "\n")
     return gave_up
 
 
@@ -2502,7 +2564,7 @@ def backfill(creds: dict[str, str], since: datetime | None = None) -> int:
         updated = prune_to_cap(updated, creds)
         write_wiki(updated)
         reviewed.update(i.item_id for i in batch)
-        REVIEWED_PATH.write_text(json.dumps(sorted(reviewed)) + "\n")
+        atomic_write(REVIEWED_PATH, json.dumps(sorted(reviewed)) + "\n")
         log(f"  -> {len(updated.split())} words")
         lint_index(updated, {i.item_id for i in batch}, archive_facts())
         if n >= MAX_BACKFILL_PASSES:
@@ -2874,6 +2936,53 @@ def commit(run_date: str, n_items: int, message: str | None = None) -> None:
 # ── Main ────────────────────────────────────────────────────────────────────
 
 
+@contextlib.contextmanager
+def run_lock():
+    """Hold an exclusive lock on LOCK_PATH, waiting for any other run to finish first.
+
+    write_archive numbers new items from what the day file already holds, and every merge
+    rewrites INDEX.md from what it read, so two overlapping runs (the daily job and a manual
+    --add-url, say) produced duplicate item ids, and the later write erased the earlier one's
+    records and merge. Waiting rather than failing means a manual add simply runs after the
+    job. flock is released by the OS when the process dies, so a crash never leaves it stuck.
+    The wait is bounded by LOCK_WAIT_SECONDS: a manual run left stuck would otherwise make
+    every launchd run hang behind it with nothing in the log but one line. The holder writes
+    its PID into the lock file so the waiting line says which process to look at.
+    """
+    try:
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        # Without the lock a run may corrupt the wiki, and a state dir that cannot hold a lock
+        # file cannot hold state.json either, so refuse instead of running unprotected.
+        log(f"ERROR cannot create the run lock {LOCK_PATH}: {exc}")
+        raise SystemExit(1) from exc
+    try:
+        deadline = time.time() + LOCK_WAIT_SECONDS
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not waiting:
+                    holder = os.pread(fd, 32, 0).decode(errors="replace").strip() or "unknown"
+                    log(f"another run (pid {holder}) holds the lock; waiting up to "
+                        f"{LOCK_WAIT_SECONDS // 60} min for it to finish")
+                    waiting = True
+                if time.time() >= deadline:
+                    log(f"ERROR the run lock {LOCK_PATH} was still held after "
+                        f"{LOCK_WAIT_SECONDS // 60} min; giving up. Check the process named above.")
+                    raise SystemExit(1)
+                time.sleep(LOCK_POLL_SECONDS)
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+        sweep_temp_files()
+        yield
+    finally:
+        os.close(fd)  # closing the descriptor releases the lock
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="AI-research ingester for the context wiki")
     ap.add_argument("--dry-run", action="store_true",
@@ -2898,7 +3007,17 @@ def main() -> int:
                     help="distil already-archived items into INDEX.md in batches; "
                          "no fetching, no watermark changes")
     args = ap.parse_args()
+    # A plain --dry-run writes nothing, so it need not wait for a running job. Every other
+    # mode is checked before the dry-run branch in run() and does write, even with --dry-run.
+    writes = (args.rebuild_index, args.prune, args.radar, args.add_url, args.add_note, args.backfill)
+    if args.dry_run and not any(writes):
+        return run(args)
+    with run_lock():
+        return run(args)
 
+
+def run(args: argparse.Namespace) -> int:
+    """One invocation of the script, in the mode args selects. main() holds the run lock."""
     override = None
     if args.since:
         override = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -2993,7 +3112,7 @@ def main() -> int:
 
     if not all_items:
         log("nothing new; leaving wiki untouched")
-        STATE_PATH.write_text(json.dumps(new_state, indent=2) + "\n")
+        atomic_write(STATE_PATH, json.dumps(new_state, indent=2) + "\n")
         write_recall(wiki_text, report)
         return 0
 
@@ -3005,7 +3124,7 @@ def main() -> int:
     all_items = [i for i in all_items if i.item_id]
     if not all_items:
         log("every fetched item was already archived and merged; nothing to do")
-        STATE_PATH.write_text(json.dumps(new_state, indent=2) + "\n")
+        atomic_write(STATE_PATH, json.dumps(new_state, indent=2) + "\n")
         return 0
 
     # Archive keeps everything; the merge sees only a bounded slice so a backfill
@@ -3050,7 +3169,7 @@ def main() -> int:
     lint_index(updated, {i.item_id for i in merged_items}, archive_facts())
 
     mark_reviewed(i.item_id for i in merged_items)
-    STATE_PATH.write_text(json.dumps(new_state, indent=2) + "\n")
+    atomic_write(STATE_PATH, json.dumps(new_state, indent=2) + "\n")
     write_recall(updated, RadarReport(radar.missing_watch(updated, read_watchlist()),
                                       report.emerging, report.queries))
     commit(run_date, len(all_items))
