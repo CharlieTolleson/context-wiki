@@ -65,7 +65,7 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -2419,7 +2419,7 @@ def plan_chunks(items: list[Item]) -> list[list[Item]]:
 
 
 def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
-                  hint: str = "", min_floor: int = 0) -> tuple[str, list[Item]]:
+                  hint: str | Callable[[str], str] = "", min_floor: int = 0) -> tuple[str, list[Item]]:
     """Merge `items` into the wiki MERGE_CHUNK at a time, each chunk against the previous result.
 
     One big prompt overwhelms the merge model: it either rewrites aggressively (tripping the
@@ -2440,7 +2440,9 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         index_md: Current wiki text.
         items: Items to merge, already selected (select_for_merge).
         creds: LiteLLM credentials.
-        hint: Coverage-radar addendum passed to every chunk.
+        hint: Coverage-radar addendum, or a function that builds it from the wiki each chunk
+            merges into. main passes a function: a concept an earlier chunk added is no longer
+            listed as missing, which invited a second claim for it (audit 2026-10-28).
         min_floor: A run floor set by the caller, used when it is higher than this call's own.
             backfill passes the floor of the wiki it started from, so its passes cannot
             compound the erosion that chunks no longer can.
@@ -2458,7 +2460,8 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         i.refused = False
     for n, chunk in enumerate(chunks, start=1):
         try:
-            out = merge_checked(current, chunk, creds, hint=hint, min_floor=run_floor)
+            out = merge_checked(current, chunk, creds, hint=hint(current) if callable(hint) else hint,
+                                min_floor=run_floor)
         except Exception as exc:
             failures += 1
             # Only a guard refusal of a lone item says the item is bad (record_merge_failures);
@@ -3372,8 +3375,9 @@ def run(args: argparse.Namespace) -> int:
     creds = load_env()
     index_md = read_wiki()
     try:
-        updated, merged_items = merge_chunked(
-            index_md, merge_items, creds, hint=radar.hint_text(report.missing, report.emerging))
+        updated, merged_items = merge_chunked(index_md, merge_items, creds, hint=lambda md: radar.hint_text(
+            [e for e in report.missing if not radar.covered(md, e)],
+            [c for c in report.emerging if not radar.alias_pattern(c.term).search(md)]))
     except Exception as exc:
         log(f"ERROR merge failed: {type(exc).__name__}: {str(exc)[:200]}")
         log("archive was written; watermarks NOT advanced so the next run retries these items")

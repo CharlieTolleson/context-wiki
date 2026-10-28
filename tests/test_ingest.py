@@ -1665,6 +1665,27 @@ def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
         a.merge_checked = real
 
 
+def test_merge_chunked_rebuilds_a_callable_hint_for_each_chunk():
+    """A concept an earlier chunk added is no longer listed as missing to the next chunk."""
+    items = [item("ab", f"https://x/{n}") for n in range(a.MERGE_CHUNK + 1)]
+    hints: list[str] = []
+    real = a.merge_checked
+
+    def fake(index_md, chunk, creds, hint="", retries=1, min_floor=0):
+        hints.append(hint)
+        return index_md + "\n- Use code mode for tool calls [2026-01-01-ab-01]"
+    try:
+        a.merge_checked = fake
+        a.merge_chunked("## S\n", items, {}, hint=lambda md: a.radar.hint_text(
+            [e for e in [["code mode", "codemode"]] if not a.radar.covered(md, e)], []))
+        assert "code mode" in hints[0] and hints[1] == ""
+        hints.clear()
+        a.merge_chunked("## S\n", items, {}, hint="fixed")         # a plain string still works
+        assert hints == ["fixed", "fixed"]
+    finally:
+        a.merge_checked = real
+
+
 def test_prune_deletes_selected_claims_and_spares_sole_watchlist_coverage():
     """Pruning removes the model's picks byte-for-byte, except the only claim on a watchlist concept."""
     import openai
