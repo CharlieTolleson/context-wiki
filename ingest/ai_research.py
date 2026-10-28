@@ -835,7 +835,7 @@ def read_wiki() -> str:
                 raise RuntimeError(f"INDEX.md points at {mark.group(1)} but it is missing; restore it from git")
             body = topic_body(path.read_text())
         parts.append(f"## {title}\n\n{body}".rstrip())
-    return "\n\n".join(parts) + "\n"
+    return unwrap_claims("\n\n".join(parts) + "\n")
 
 
 def _stub(title: str, slug: str, body: str) -> str:
@@ -1274,7 +1274,7 @@ being verbose.
 - MAXIMUM {WORD_CAP} WORDS, hard cap.
 - Organize under these H2 sections; omit any section entirely if it has no claims:
 {chr(10).join('  - ' + t for t in TOPICS)}
-- Each claim is a markdown bullet of one or two lines, written as guidance a builder can
+- Each claim is a markdown bullet on ONE line (no line breaks inside it), written as guidance a builder can
   follow, ending with `— <source-name>, <published-date> [<item-ids>]`. The angle-bracketed
   parts are PLACEHOLDERS to replace with real values from the item header:
     * `<source-name>` is the item's `source:` field (e.g. `hf-blog`), NOT the word "source".
@@ -1584,6 +1584,46 @@ class MergeRejected(Exception):
     """A merge result failed the shrink guard twice; INDEX.md must stay untouched."""
 
 
+# A horizontal rule or setext underline ("---", "* * *", "===").
+_RULE = re.compile(r"\s*([-*_=])(?:\s*\1){2,}\s*$")
+# A line that starts its own Markdown block, so it is never joined onto the bullet above:
+# a list item of any marker, an ATX heading, a quote, a table row, an HTML tag or comment.
+# "#1 on SWE-bench" is not a heading and "<5ms" is not a tag, so both join.
+_OWN_BLOCK = re.compile(r"\s*(?:[-*+]\s|\d+[.)]\s|#{1,6}(?:\s|$)|<[A-Za-z/!?]|[|>])")
+# A code fence opener: three or more backticks or tildes, and no backtick after them, so a
+# line that starts with inline ```code``` is not a fence.
+_FENCE = re.compile(r"\s*(`{3,}|~{3,})[^`]*$")
+
+
+def unwrap_claims(md: str) -> str:
+    """Join each claim's continuation lines onto its bullet, so every claim is one line.
+
+    Prune, the drop log, the watchlist protection and the lint all treat a bullet line as a
+    whole claim. A claim wrapped over two lines (the prompt used to allow it) carries its
+    ids on the second line, so prune deleted only the first line and left the ids behind
+    as an orphan, the deletion went unlogged, and a watchlist term on the second line was
+    not protected. Lines that start their own block (_OWN_BLOCK, _RULE), blank lines and code
+    fences are kept as they are, and nothing inside a fenced block is joined. A fence is
+    closed only by the same character at least as long, as in CommonMark.
+    """
+    out: list[str] = []
+    fence = ""                      # the open fence's run of ` or ~, empty outside a fence
+    for ln in md.splitlines():
+        s = ln.strip()
+        m = _FENCE.match(ln)
+        if fence:
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and s == m.group(1):
+                fence = ""
+        elif m:
+            fence = m.group(1)
+        elif (s and out and out[-1].lstrip().startswith(("- ", "* "))
+              and not _RULE.match(out[-1]) and not _OWN_BLOCK.match(ln) and not _RULE.match(ln)):
+            out[-1] = out[-1].rstrip() + " " + s
+            continue
+        out.append(ln)
+    return "\n".join(out) + ("\n" if md.endswith("\n") else "")
+
+
 def count_claims(md: str) -> int:
     """Number of bullet claims in a wiki document."""
     return sum(1 for ln in md.splitlines() if ln.lstrip().startswith(("- ", "* ")))
@@ -1656,7 +1696,7 @@ def merge_checked(index_md: str, items: list[Item], creds: dict[str, str], hint:
     def problems(text: str) -> tuple[int, list[list[str]]]:
         return count_claims(text), radar.lost_watch(index_md, text, watch)
 
-    updated = merge_index(index_md, items, creds, **extra)
+    updated = unwrap_claims(merge_index(index_md, items, creds, **extra))
     if not updated:
         return updated
     kept, lost = problems(updated)
@@ -1680,7 +1720,7 @@ def merge_checked(index_md: str, items: list[Item], creds: dict[str, str], hint:
                 + "; ".join(" / ".join(e) for e in lost) + ". Restore the claim(s), or replace them "
                 "with a newer claim that names the concept.")
         parts.append("Return the COMPLETE wiki again.\nClaims your previous answer dropped:\n" + listing)
-        updated = merge_index(index_md, items, creds, correction="\n".join(parts), **extra)
+        updated = unwrap_claims(merge_index(index_md, items, creds, correction="\n".join(parts), **extra))
         kept, lost = problems(updated) if updated else (0, [])
         history.append((kept, lost))
     if updated and kept >= floor and not lost:
@@ -1774,7 +1814,7 @@ def prune_to_cap(index_md: str, creds: dict[str, str]) -> str:
     from openai import OpenAI
 
     watch = read_watchlist()
-    current = index_md
+    current = unwrap_claims(index_md)
     for n in range(1, MAX_PRUNE_PASSES + 1):
         words = len(current.split())
         if words <= WORD_CAP:
