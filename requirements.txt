@@ -1,1 +1,1 @@
-openai>=1.30
+openai>=1.55.3,<4  # older releases pass proxies= to httpx>=0.28 and crash on every call; tested through 3.39
