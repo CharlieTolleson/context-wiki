@@ -14,6 +14,7 @@ Topic pointers can only lead inside topics/.
 Lint checks citations against the archive (fabricated ids, changed dates, bodiless sources).
 The merge prompt's untrusted block neutralises delimiter variants and spoofed item headers.
 Small merge batches are quota-capped per source, and the HF papers fetcher selects by listing day.
+The radar filter's reply parser accepts candidate numbers or listed terms, fenced or not.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -1488,6 +1489,94 @@ def test_hf_papers_keeps_papers_listed_today_but_published_earlier():
     assert [it.url for it in items] == ["https://huggingface.co/papers/2510.01234"]
     assert items[0].published == published                  # publishedAt is kept for attribution
     assert items[0].body == "abstract"
+
+
+def _radar_cands(*terms: str) -> list:
+    """Radar candidates with the given terms and placeholder evidence counts."""
+    return [radar.Candidate(term=t, key=t.replace(" ", ""), items=3, sources=2, in_titles=0, baseline=0)
+            for t in terms]
+
+
+def test_radar_picks_accept_numbers_in_a_fence():
+    """A fenced array of numbers picks those candidates in reply order; out-of-range numbers are ignored."""
+    cands = _radar_cands("codemode", "france", "tool search")
+    picked = a.parse_radar_picks("```json\n[2, 0, 9]\n```", cands)
+    assert [c.term for c in picked] == ["tool search", "codemode"]
+
+
+def test_radar_picks_accept_terms_but_only_listed_ones():
+    """A reply of terms (the 2026-10-23 failure) maps back to candidates; an unlisted term is dropped."""
+    cands = _radar_cands("embeddinggemma", "vllm", "france")
+    raw = '```json\n[\n    "embeddinggemma",\n    "VLLM",\n    "deepinfer",\n    "vllm"\n]\n```'
+    picked = a.parse_radar_picks(raw, cands)
+    assert [c.term for c in picked] == ["embeddinggemma", "vllm"]
+
+
+def test_radar_picks_none_without_an_array():
+    """A reply with no JSON array returns None so the caller logs a filter failure."""
+    assert a.parse_radar_picks("I cannot help with that.", _radar_cands("vllm")) is None
+    assert a.parse_radar_picks("[not json]", _radar_cands("vllm")) is None
+
+
+
+def test_radar_picks_skip_bracketed_prose_before_the_answer():
+    """Brackets in reasoning or prose before the answer do not hide the real array."""
+    cands = _radar_cands("codemode", "france", "tool search")
+    assert [c.term for c in a.parse_radar_picks("Candidates (see [notes]): [0, 2]", cands)] == \
+        ["codemode", "tool search"]
+    assert [c.term for c in a.parse_radar_picks("<think>maybe [codemode]?</think>\n[2]", cands)] == \
+        ["tool search"]
+
+
+def test_radar_picks_accept_python_style_and_quoted_number_replies():
+    """Single-quoted terms and numbers sent as strings still map to candidates."""
+    cands = _radar_cands("vllm", "codemode", "france")
+    assert [c.term for c in a.parse_radar_picks("['vllm', 'codemode']", cands)] == ["vllm", "codemode"]
+    assert [c.term for c in a.parse_radar_picks('["\'vllm\'"]', cands)] == ["vllm"]
+    assert [c.term for c in a.parse_radar_picks('["0", "1"]', cands)] == ["vllm", "codemode"]
+    assert a.parse_radar_picks("[]", cands) == []
+
+
+_RADAR_REPLY_CASES = [
+    # Trailing prose, an echo of the candidates, or a "rejected" list never overrides the answer.
+    ('```json\n[0, 2]\n```\nExcluded [1, 3]: place names.', ["codemode", "tool search"]),
+    ('{"picks": [0, 2], "rejected": [1, 3]}', ["codemode", "tool search"]),
+    ('{"keep": ["codemode", "tool search"], "reject": ["france", "paris"]}', ["codemode", "tool search"]),
+    ('[0, 2]\n\nConsidered: [0, 1, 2, 3]', ["codemode", "tool search"]),
+    # A year or empty note after a terms answer is not the answer.
+    ('["codemode", "tool search"] (news from [2026])', ["codemode", "tool search"]),
+    ('["codemode"]\nOthers: []', ["codemode"]),
+    # Thinking before the answer: out-of-range or unlisted guesses and <think> blocks are skipped.
+    ("maybe [9]? final: [0]", ["codemode"]),
+    ('maybe ["deepinfer"]? final: ["codemode"]', ["codemode"]),
+    ("<think>[1]? no.</think>[0]", ["codemode"]),
+    ("[1]? no.</think>\n[0]", ["codemode"]),
+    ('{"rejected": [1, 3]}', None),
+    ('Candidates: ["vllm"]. None qualify: []', []),
+    # Numbers are the format asked for: they beat quoted terms, and an echo of every term is
+    # no answer.
+    ('Of ["codemode", "france", "tool search"], the techniques are: [0, 2]', ["codemode", "tool search"]),
+    ('Candidates: ["codemode", "france", "tool search", "paris"]. None qualify: []', []),
+    ('[0, "tool search"]', ["codemode", "tool search"]),
+    # Known limit: a cited line number reads as a number answer and beats the terms answer.
+    ('Answer: ["codemode"] (per line [1])', ["france"]),
+]
+
+
+def test_radar_picks_read_the_answer_by_structure_not_position():
+    """The answer is the JSON reply (or its answer key), else the first array naming a candidate."""
+    cands = _radar_cands("codemode", "france", "tool search", "paris")
+    for raw, want in _RADAR_REPLY_CASES:
+        picked = a.parse_radar_picks(raw, cands)
+        got = None if picked is None else [c.term for c in picked]
+        assert got == want, raw
+
+
+def test_radar_picks_survive_odd_digits():
+    """A superscript digit or a huge number is skipped, not an exception that drops the filter."""
+    cands = _radar_cands("codemode", "france")
+    assert a.parse_radar_picks('["\u00b2"]', cands) == []
+    assert [c.term for c in a.parse_radar_picks("[" + "9" * 5000 + "] [0]", cands)] == ["codemode"]
 
 
 def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():

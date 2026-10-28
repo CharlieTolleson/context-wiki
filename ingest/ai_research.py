@@ -39,6 +39,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ast
 import html
 import ipaddress
 import json
@@ -1069,7 +1070,7 @@ def filter_candidates(cands: list["radar.Candidate"], window: list[Item],
                 text = f"{it.title}\n{it.body[:3000]}"
                 ctx = text[max(0, m.start() - 90): m.end() + 90].replace("\n", " ")
                 break
-        lines.append(f"{n}. {c.term!r}: ...{ctx}...")
+        lines.append(f"{n}. {json.dumps(c.term)}: ...{ctx}...")
     prompt = (
         "These terms recur in recent AI-engineering news and are new to our archive. Reply with "
         "ONLY a JSON array of the numbers whose term names a technique, design pattern, protocol, "
@@ -1087,14 +1088,121 @@ def filter_candidates(cands: list["radar.Candidate"], window: list[Item],
             model=RADAR_MODEL, max_tokens=2000,   # headroom: the cheap alias may spend tokens thinking
             messages=[{"role": "user", "content": prompt}])
         raw = resp.choices[0].message.content or ""
-        found = re.search(r"\[[\d,\s]*\]", raw)
-        if not found:
+        picked = parse_radar_picks(raw, cands)
+        if picked is None:
             raise ValueError(f"no JSON array in reply {raw[:80]!r} (finish_reason={resp.choices[0].finish_reason})")
-        picked = json.loads(found.group(0))
-        return [cands[i] for i in picked if isinstance(i, int) and 0 <= i < len(cands)][:8]
+        return picked
     except Exception as exc:
         log(f"WARN radar filter failed: {type(exc).__name__}: {str(exc)[:100]}")
         return []
+
+
+def parse_radar_picks(raw: str, cands: list["radar.Candidate"]) -> list["radar.Candidate"] | None:
+    """Read the radar filter's reply: a JSON array of candidate numbers or of the terms themselves.
+
+    The prompt asks for numbers, but the cheap model sometimes answers with the terms
+    (the 2026-10-23 run got a fenced ["embeddinggemma", "vllm", ...] and the whole filter
+    failed, so the radar flagged nothing). A term only counts when it matches a candidate's
+    term exactly (case-insensitive), so the reply can never add a term of its own.
+
+    Args:
+        raw: the model's reply text, possibly wrapped in a ```json fence or prose.
+        cands: the candidates the prompt listed, in prompt order.
+
+    Returns:
+        Up to 8 picked candidates, de-duplicated in reply order. The answer is found by
+        structure, not position: a reply (or ```json fence) that is itself JSON is read
+        directly; otherwise the first number array that names a candidate wins, then the
+        first term array that names one (an echo of every candidate is skipped). [] when
+        the answer names no candidate; None when the reply holds no parseable array, or is a
+        JSON object with no answer key (the caller logs that as a filter failure).
+    """
+    by_term = {c.term.lower(): c for c in cands}
+
+    def as_number(v: object) -> int | None:
+        if isinstance(v, str):
+            v = v.strip().strip("'\"").strip()
+            # isascii: "²".isdigit() is True but int("²") raises; the length cap keeps int()
+            # clear of Python's digit limit, and no candidate list is that long anyway.
+            if not (v.isascii() and v.isdigit() and len(v) <= 6):
+                return None
+            v = int(v)      # ["0", "2"] means numbers, not terms
+        # bool is an int subclass; json never yields True for a number, but be explicit.
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    def pick(v: object) -> "radar.Candidate | None":
+        n = as_number(v)
+        if n is not None:
+            return cands[n] if 0 <= n < len(cands) else None
+        return by_term.get(v.strip().strip("'\"").strip().lower()) if isinstance(v, str) else None
+
+    def picks(values: list) -> list["radar.Candidate"]:
+        if len(values) == 1 and isinstance(values[0], list):
+            values = values[0]      # [[0, 2]]
+        out: list["radar.Candidate"] = []
+        for v in values:
+            c = pick(v)
+            if c is not None and c not in out:
+                out.append(c)
+        return out[:8]
+
+    def load(text: str) -> object:
+        try:
+            return json.loads(text)
+        except ValueError:      # JSONDecodeError, or an int past the digit limit
+            try:
+                return ast.literal_eval(text)   # a Python-style ['vllm', 'codemode']
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                return None
+
+    def answer_of(obj: dict) -> list | None:
+        # {"picks": [0, 2], "rejected": [1, 3]}: only an answer-style key counts, never the
+        # rejected, excluded, or considered list, so a lone list under such a key is no answer.
+        lists = {str(k).lower(): v for k, v in obj.items() if isinstance(v, list)}
+        for key in ("picks", "picked", "keep", "kept", "selected", "selection", "answer",
+                    "terms", "result", "results", "numbers"):
+            if key in lists:
+                return lists[key]
+        if len(lists) == 1:
+            key, values = next(iter(lists.items()))
+            if not re.search(r"reject|exclu|consider|candidate|skip|drop|discard|other|not", key):
+                return values
+        return None
+
+    # Reasoning is not the answer: drop <think> blocks (and a dangling close tag's prefix,
+    # when the provider strips the opening tag) before looking at any bracket.
+    text = re.sub(r"<think>.*?</think>", " ", raw, flags=re.S | re.I)
+    text = re.sub(r"^.*</think>", " ", text, flags=re.S | re.I).strip()
+
+    # The reply, or a fenced block in it, is JSON: its structure says which list is the
+    # answer, so trailing prose ("Excluded [1, 3]") or a "rejected" key never competes.
+    for block in [text] + re.findall(r"```[a-zA-Z]*\s*\n?(.*?)```", text, flags=re.S):
+        obj = load(block.strip())
+        if isinstance(obj, list):
+            return picks(obj)
+        if isinstance(obj, dict):
+            values = answer_of(obj)
+            return picks(values) if values is not None else None
+
+    # Prose around the answer. Numbers are the format asked for, so the first number array
+    # that names a candidate wins; only without one is the first term array read. Arrays
+    # that name none (a thought like "maybe [9]?", "[notes]", a year, an empty "Others: []")
+    # are skipped, so they neither hide nor override the answer. A term array naming every
+    # candidate (3 or more) echoes the input and is never an answer.
+    arrays = [v for v in (load(m.group(0)) for m in re.finditer(r"\[[^\[\]]*\]", text))
+              if isinstance(v, list)]
+    if not arrays:
+        return None
+    numeric = [v for v in arrays if v and all(as_number(x) is not None for x in v)]
+    for values in numeric:
+        if picked := picks(values):
+            return picked
+    for values in arrays:
+        picked = picks(values)
+        if picked and not (len(cands) >= 3 and len(picked) == len(cands)):
+            return picked
+    log(f"NOTE radar filter reply arrays matched no candidate: {raw[:80]!r}")
+    return []
 
 
 def radar_scan(wiki_text: str, creds: dict[str, str] | None) -> RadarReport:
