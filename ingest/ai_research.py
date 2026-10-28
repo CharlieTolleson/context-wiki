@@ -2106,7 +2106,7 @@ def new_unsafe_output(old_md: str, new_md: str) -> list[str]:
 
 
 def merge_checked(index_md: str, items: list[Item], creds: dict[str, str], hint: str = "",
-                  retries: int = 1) -> str:
+                  retries: int = 1, min_floor: int = 0) -> str:
     """merge_index plus the shrink guard, the watchlist guard, the output guard, and retries.
 
     Three things make a merge result unacceptable: it kept too few of the existing claims
@@ -2123,6 +2123,10 @@ def merge_checked(index_md: str, items: list[Item], creds: dict[str, str], hint:
         hint: Optional prompt addendum (coverage radar, or the prune instruction).
         retries: Corrective retries after the first attempt. Pruning passes use 2 because a
             cut that must also keep every watchlist concept often needs a second correction.
+        min_floor: A claim count the result must also reach, on top of claim_floor(index_md).
+            merge_chunked passes the floor of the wiki its run started from, so a chunk that
+            erodes the run is corrected like any other shrink, and rejected before its drops
+            are logged.
 
     Returns:
         The accepted wiki text, or "" if the model returned nothing.
@@ -2136,7 +2140,7 @@ def merge_checked(index_md: str, items: list[Item], creds: dict[str, str], hint:
     # Only pass hint when set, so a merge_index replacement that predates the parameter still works.
     extra = {"hint": hint} if hint else {}
     watch = read_watchlist()
-    floor = claim_floor(index_md)
+    floor = max(claim_floor(index_md), min_floor)
     had = count_claims(index_md)
 
     def problems(text: str) -> tuple[int, list[list[str]], list[str]]:
@@ -2212,7 +2216,7 @@ def plan_chunks(items: list[Item]) -> list[list[Item]]:
 
 
 def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
-                  hint: str = "") -> tuple[str, list[Item]]:
+                  hint: str = "", min_floor: int = 0) -> tuple[str, list[Item]]:
     """Merge `items` into the wiki MERGE_CHUNK at a time, each chunk against the previous result.
 
     One big prompt overwhelms the merge model: it either rewrites aggressively (tripping the
@@ -2223,11 +2227,20 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
     MAX_SOLO_MERGES items whose chunk failed in an earlier run go first, one per chunk
     (plan_chunks).
 
+    merge_checked measures each chunk against the previous chunk's result, so on its own the
+    shrink floor compounds: four chunks that each keep 76% end a run with a third of the wiki,
+    the 2026-10-02 failure the guard exists to stop. Every chunk must therefore also keep the
+    floor of the wiki the run started from. merge_checked enforces it, so a chunk under it gets
+    the same corrective retry as any other shrink, and a rejected chunk logs no drops.
+
     Args:
         index_md: Current wiki text.
         items: Items to merge, already selected (select_for_merge).
         creds: LiteLLM credentials.
         hint: Coverage-radar addendum passed to every chunk.
+        min_floor: A run floor set by the caller, used when it is higher than this call's own.
+            backfill passes the floor of the wiki it started from, so its passes cannot
+            compound the erosion that chunks no longer can.
 
     Returns:
         (wiki text after all accepted chunks, items that were successfully merged).
@@ -2236,12 +2249,13 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         MergeRejected: Every chunk failed, so nothing was merged.
     """
     current, merged, failures = index_md, [], 0
+    run_floor = max(claim_floor(index_md), min_floor)
     chunks = plan_chunks(items)
     for i in items:
         i.refused = False
     for n, chunk in enumerate(chunks, start=1):
         try:
-            out = merge_checked(current, chunk, creds, hint=hint)
+            out = merge_checked(current, chunk, creds, hint=hint, min_floor=run_floor)
         except Exception as exc:
             failures += 1
             # Only a guard refusal of a lone item says the item is bad (record_merge_failures);
@@ -2368,7 +2382,7 @@ def _claim_lines(md: str) -> list[int]:
     return [n for n, ln in enumerate(md.splitlines()) if ln.lstrip().startswith(("- ", "* "))]
 
 
-def prune_to_cap(index_md: str, creds: dict[str, str]) -> str:
+def prune_to_cap(index_md: str, creds: dict[str, str], min_floor: int = 0) -> str:
     """Bring an over-cap wiki back under WORD_CAP by deleting claims chosen by a model.
 
     Why selection, not a rewrite: the first design asked the merge model to return a shorter
@@ -2384,6 +2398,10 @@ def prune_to_cap(index_md: str, creds: dict[str, str]) -> str:
     Args:
         index_md: Current wiki text.
         creds: LiteLLM credentials.
+        min_floor: A claim count the prune must also keep, on top of claim_floor(index_md).
+            After a merge, callers pass the floor of the wiki the run started from: the merge
+            may have just reached that floor, and a floor taken from the merged text alone
+            would let the prune cut below it. Holding it can leave the wiki over the cap.
 
     Returns:
         The wiki text, under the cap if the model complied within MAX_PRUNE_PASSES; otherwise
@@ -2441,7 +2459,7 @@ def prune_to_cap(index_md: str, creds: dict[str, str]) -> str:
         # (a bad reply, or one steered by text in a claim) wiped all but the protected claims,
         # and the result was written: merge_checked's guard never sees prune output (audit
         # 2026-10-23).
-        floor = claim_floor(index_md)
+        floor = max(claim_floor(index_md), min_floor)
         remaining_words, remaining_claims = words, len(claim_ix)
         drop: set[int] = set()
         for k in order:
@@ -2537,6 +2555,9 @@ def backfill(creds: dict[str, str], since: datetime | None = None) -> int:
     # source publishes most (papers, ~25:1), which is what filled the wiki with
     # abstracts in the first place.
     total_passes = (len(pending) + MAX_MERGE_ITEMS - 1) // MAX_MERGE_ITEMS
+    # One floor for the whole backfill, from the wiki before the first pass. A per-pass floor
+    # would let each pass keep 75% of the last one, so 8 passes could end with a tenth of it.
+    run_floor = claim_floor(read_wiki())
     remaining = list(pending)
     n = 0
     while remaining:
@@ -2553,7 +2574,7 @@ def backfill(creds: dict[str, str], since: datetime | None = None) -> int:
             f"({', '.join(f'{k}:{v}' for k, v in sorted(mix.items()))})")
         index_md = read_wiki()
         try:
-            updated, batch = merge_chunked(index_md, batch, creds)
+            updated, batch = merge_chunked(index_md, batch, creds, min_floor=run_floor)
         except Exception as exc:
             log(f"ERROR pass {n} failed: {type(exc).__name__}: {str(exc)[:160]}")
             log("stopping; passes already applied are saved and committed")
@@ -2561,7 +2582,7 @@ def backfill(creds: dict[str, str], since: datetime | None = None) -> int:
         if not updated:
             log(f"ERROR pass {n} returned empty output; stopping")
             return 1
-        updated = prune_to_cap(updated, creds)
+        updated = prune_to_cap(updated, creds, min_floor=run_floor)
         write_wiki(updated)
         reviewed.update(i.item_id for i in batch)
         atomic_write(REVIEWED_PATH, json.dumps(sorted(reviewed)) + "\n")
@@ -3163,7 +3184,7 @@ def run(args: argparse.Namespace) -> int:
         log(f"WARN watermark held for {', '.join(held)}: a merge chunk with their items failed, "
             f"so the next run refetches them and merges up to {MAX_SOLO_MERGES} of them alone first")
 
-    updated = prune_to_cap(updated, creds)
+    updated = prune_to_cap(updated, creds, min_floor=claim_floor(index_md))
     write_wiki(updated)
     log(f"INDEX.md rewritten: {len(updated.split())} words (cap {WORD_CAP})")
     lint_index(updated, {i.item_id for i in merged_items}, archive_facts())

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1221,6 +1222,82 @@ def test_accepted_merges_log_the_claims_they_removed():
 # ── chunked merge and pruning ───────────────────────────────────────────────
 
 
+def _eroding_merge(calls: list[str], fixed: dict[int, int] | None = None):
+    """merge_index stub keeping 80% of the wiki it is given, correction or not.
+
+    fixed maps a call number to the claim count that call returns instead.
+    """
+    def f(index_md, items, creds, correction="", **kw):
+        calls.append(correction)
+        if fixed and len(calls) in fixed:
+            return doc(fixed[len(calls)])
+        return doc(math.ceil(a.count_claims(index_md) * 0.8))   # passes merge_checked's own 75% floor
+    return f
+
+
+def test_merge_chunked_holds_the_run_floor_and_logs_only_real_drops():
+    """Chunks cannot erode below the starting wiki's floor, and refused chunks log no drops."""
+    items = [item("ab", f"https://x/{n}") for n in range(a.MERGE_CHUNK * 4)]
+    start = doc(40)
+    calls: list[str] = []
+    real = a.merge_index
+    with sandbox():
+        a.merge_index = _eroding_merge(calls)
+        try:
+            out, merged = a.merge_chunked(start, items, {})
+        finally:
+            a.merge_index = real
+        logged = a.DROPPED_PATH.read_text().splitlines()
+    assert a.count_claims(out) == 32 >= a.claim_floor(start)        # chunk 1 only; 2-4 went under 30
+    assert len(merged) == a.MERGE_CHUNK
+    assert len(logged) == 40 - 32                                   # was 26 when refused chunks logged too
+    assert len(calls) == 7 and sum(bool(c) for c in calls) == 3     # one correction per refused chunk
+
+
+def test_run_floor_miss_gets_a_corrective_retry():
+    """A chunk under the run's floor (but not its own) is corrected, and the corrected answer lands."""
+    items = [item("ab", f"https://x/{n}") for n in range(a.MERGE_CHUNK * 2)]
+    start = doc(40)
+    calls: list[str] = []
+    real = a.merge_index
+    with sandbox():
+        a.merge_index = _eroding_merge(calls, fixed={2: 26, 3: 33})  # 26 >= 0.75 * 32, but < 30
+        try:
+            out, merged = a.merge_chunked(start, items, {})
+        finally:
+            a.merge_index = real
+    assert len(calls) == 3 and not calls[1] and "CORRECTION" in calls[2]
+    assert "at least 30" in calls[2]
+    assert a.count_claims(out) == 33 and len(merged) == len(items)
+
+
+def test_backfill_passes_hold_the_starting_floor():
+    """Each backfill pass merges against the last, but the floor comes from the wiki before pass 1."""
+    items = [item("ab", f"https://x/{n}") for n in range(a.MAX_MERGE_ITEMS * 2)]
+    for n, it in enumerate(items):
+        it.item_id = f"2026-01-01-zz-{n:03d}"
+    start = doc(40)
+    calls: list[str] = []
+    prune_floors: list[int] = []
+    saved = {n: getattr(a, n) for n in ("merge_index", "read_archive", "prune_to_cap", "lint_index", "commit")}
+    with sandbox():
+        a.write_wiki(start)
+        a.merge_index = _eroding_merge(calls)
+        a.read_archive = lambda: list(items)
+        a.prune_to_cap = lambda md, creds, min_floor=0: prune_floors.append(min_floor) or md
+        a.lint_index = lambda *args, **kw: None
+        a.commit = lambda *args, **kw: None
+        try:
+            a.backfill({})
+        finally:
+            for n, v in saved.items():
+                setattr(a, n, v)
+        final = a.count_claims(a.read_wiki())
+    floor = a.claim_floor(start)
+    assert prune_floors and all(f == floor for f in prune_floors)
+    assert final >= floor                                           # a per-pass floor reached 26 here
+
+
 def test_hold_watermarks_keeps_old_watermark_for_sources_in_a_failed_chunk():
     """A source with an unmerged item keeps its old watermark (or none); fully merged sources advance."""
     def it(source: str, n: int) -> a.Item:
@@ -1308,7 +1385,7 @@ def test_a_poisoned_item_does_not_get_its_chunk_mates_given_up():
     calls: list[int] = []
     real = a.merge_checked
 
-    def fake(index_md, chunk, creds, hint="", retries=1):
+    def fake(index_md, chunk, creds, hint="", retries=1, min_floor=0):
         calls.append(len(chunk))
         if any(i.title == "POISON" for i in chunk):
             raise a.MergeRejected("guard")
@@ -1344,7 +1421,7 @@ def test_a_lone_item_that_fails_on_a_connection_error_is_not_given_up():
     lone.item_id, lone.retry = "2026-01-01-ab-01", True
     real = a.merge_checked
 
-    def outage(index_md, chunk, creds, hint="", retries=1):
+    def outage(index_md, chunk, creds, hint="", retries=1, min_floor=0):
         raise ConnectionError("APIConnectionError: Connection error.")
     try:
         a.merge_checked = outage
@@ -1405,7 +1482,7 @@ def test_main_gives_up_on_an_item_that_fails_alone_every_run():
     def fetch(name, slug, url, since):
         return [a.Item(name, slug, "POISON", "https://x/poison", now - timedelta(hours=1), "body " * 200)]
 
-    def reject(index_md, chunk, creds, hint="", retries=1):
+    def reject(index_md, chunk, creds, hint="", retries=1, min_floor=0):
         raise a.MergeRejected("guard")
     try:
         a.SOURCES = [("blog", "bl", "stub", "https://x/feed")]
@@ -1414,7 +1491,7 @@ def test_main_gives_up_on_an_item_that_fails_alone_every_run():
         a.load_env = lambda: {}
         a.radar_scan = lambda wiki, creds: a.RadarReport([], [], [])
         a.enrich_thin = lambda items: None
-        a.prune_to_cap = lambda md, creds: md
+        a.prune_to_cap = lambda md, creds, min_floor=0: md
         a.commit = lambda *args: None
         a.lint_index = lambda *args, **kw: None
         sys.argv = ["ai_research.py"]
@@ -1436,7 +1513,7 @@ def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
     seen: list[int] = []
     real = a.merge_checked
 
-    def fake(index_md, chunk, creds, hint="", retries=1):
+    def fake(index_md, chunk, creds, hint="", retries=1, min_floor=0):
         seen.append(len(chunk))
         if len(seen) == 2:
             raise a.MergeRejected("nope")
@@ -1505,14 +1582,14 @@ class _PruneClient:
         return type("R", (), {"choices": [type("Ch", (), {"message": msg})()]})()
 
 
-def _prune_with(wiki: str, replies: list) -> str:
+def _prune_with(wiki: str, replies: list, min_floor: int = 0) -> str:
     """Run prune_to_cap against _PruneClient serving `replies`."""
     import openai
     _PruneClient.replies, _PruneClient.calls = replies, 0
     real = openai.OpenAI
     openai.OpenAI = _PruneClient
     try:
-        return a.prune_to_cap(wiki, {"base_url": "x", "api_key": "y"})
+        return a.prune_to_cap(wiki, {"base_url": "x", "api_key": "y"}, min_floor=min_floor)
     finally:
         openai.OpenAI = real
 
@@ -1576,6 +1653,17 @@ def test_prune_reply_naming_every_claim_stops_at_target_and_floor():
         assert kept >= a.claim_floor(wiki)
         assert kept > 20                                    # was 0 before the bound
         assert len(out.split()) <= a.WORD_CAP
+
+
+def test_prune_keeps_the_run_floor_of_the_wiki_before_the_merge():
+    """A merge that just reached the run's floor cannot be pruned below it, even if that leaves it over cap."""
+    with sandbox():
+        start = doc(100, words_per_claim=11)                # under the cap, floor 75
+        merged = doc(76, words_per_claim=24)                # held the floor, but over the cap
+        assert len(merged.split()) > a.WORD_CAP
+        run_floor = a.claim_floor(start)
+        out = _prune_with(merged, [list(range(76))], min_floor=max(a.claim_floor(merged), run_floor))
+        assert a.count_claims(out) >= run_floor             # was 63 with the floor taken from `merged`
 
 
 def test_prune_logs_each_deleted_claim_once_across_passes():
