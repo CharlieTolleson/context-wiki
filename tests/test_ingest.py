@@ -2182,13 +2182,56 @@ def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
         a.http_get = real
 
 
+class _MonkeyPatch:
+    """The part of pytest's monkeypatch fixture these tests use, for the direct runner below.
+
+    The scheduled machine's venv has no pytest, so `python tests/test_ingest.py` must run
+    every test, including the ones that take a monkeypatch argument.
+    """
+
+    _UNSET = object()
+
+    def __init__(self) -> None:
+        self._undo: list = []
+
+    def setattr(self, obj, name: str, value) -> None:
+        old = getattr(obj, name, self._UNSET)
+        self._undo.append(lambda: delattr(obj, name) if old is self._UNSET else setattr(obj, name, old))
+        setattr(obj, name, value)
+
+    def setenv(self, name: str, value: str) -> None:
+        old = os.environ.get(name)
+        self._undo.append(lambda: os.environ.pop(name, None) if old is None else os.environ.__setitem__(name, old))
+        os.environ[name] = value
+
+    def delenv(self, name: str, raising: bool = True) -> None:
+        if name not in os.environ:
+            if raising:
+                raise KeyError(name)
+            return
+        old = os.environ.pop(name)
+        self._undo.append(lambda: os.environ.__setitem__(name, old))
+
+    def undo(self) -> None:
+        while self._undo:
+            self._undo.pop()()
+
+
 if __name__ == "__main__":
+    import inspect
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = 0
     for name, fn in tests:
+        mp = _MonkeyPatch()
         try:
-            fn(); print(f"ok    {name}")
+            if "monkeypatch" in inspect.signature(fn).parameters:
+                fn(mp)
+            else:
+                fn()
+            print(f"ok    {name}")
         except Exception as exc:  # noqa: BLE001
             failed += 1; print(f"FAIL  {name}: {type(exc).__name__}: {exc}")
+        finally:
+            mp.undo()
     print(f"\n{len(tests) - failed}/{len(tests)} passed")
     sys.exit(1 if failed else 0)
