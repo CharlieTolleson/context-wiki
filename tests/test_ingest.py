@@ -2158,6 +2158,17 @@ def test_radar_picks_survive_odd_digits():
     assert [c.term for c in a.parse_radar_picks("[" + "9" * 5000 + "] [0]", cands)] == ["codemode"]
 
 
+def test_radar_hits_are_quota_capped_in_a_small_batch():
+    """A radar search can return dozens of title-only stories; only SOURCE_QUOTA of them merge."""
+    now = datetime.now(timezone.utc)
+    radar_items = [a.Item("hn-radar", "hr", f"Story {n}", f"https://x/r{n}", now - timedelta(days=n), "(10 points)")
+                   for n in range(30)]
+    blog = [a.Item("blog", "bl", f"Post {n}", f"https://x/b{n}", now, "body " * 50) for n in range(5)]
+    picked = a.select_for_merge(radar_items + blog)
+    assert sum(i.source == "hn-radar" for i in picked) == a.SOURCE_QUOTA["hn-radar"] < 30
+    assert sum(i.source == "blog" for i in picked) == 5
+
+
 def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
     """One listing day that errors raises naming that day (main() then holds the watermark)."""
     import urllib.error
@@ -2182,15 +2193,6 @@ def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
         a.http_get = real
 
 
-def test_radar_hits_are_quota_capped_in_a_small_batch():
-    """A radar search can return dozens of title-only stories; only SOURCE_QUOTA of them merge."""
-    now = datetime.now(timezone.utc)
-    radar_items = [a.Item("hn-radar", "hr", f"Story {n}", f"https://x/r{n}", now - timedelta(days=n), "(10 points)")
-                   for n in range(30)]
-    blog = [a.Item("blog", "bl", f"Post {n}", f"https://x/b{n}", now, "body " * 50) for n in range(5)]
-    picked = a.select_for_merge(radar_items + blog)
-    assert sum(i.source == "hn-radar" for i in picked) == a.SOURCE_QUOTA["hn-radar"] < 30
-    assert sum(i.source == "blog" for i in picked) == 5
 
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
