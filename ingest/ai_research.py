@@ -46,7 +46,9 @@ import ast
 import collections
 import contextlib
 import fcntl
+import functools
 import html
+import http.client
 import ipaddress
 import json
 import math
@@ -56,6 +58,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -337,6 +340,24 @@ class UnsafeURLError(urllib.error.URLError):
     """
 
 
+_EMBEDS_IPV4 = tuple(ipaddress.ip_network(n) for n in
+                     ("::ffff:0:0/96", "::/96", "64:ff9b::/96", "::ffff:0:0:0/96"))
+
+
+def _require_public(host: str, addr: str) -> None:
+    """Raise UnsafeURLError unless addr is a globally routable unicast address."""
+    # IPv6 results can carry a zone suffix ("fe80::1%en0") that ip_address rejects.
+    ip = ipaddress.ip_address(str(addr).split("%", 1)[0])
+    # ::ffff:127.0.0.1 is loopback in disguise; judge the embedded IPv4 address. The same
+    # goes for the other forms that carry an IPv4 address in their last 32 bits: NAT64
+    # (64:ff9b::7f00:1 reaches 127.0.0.1 through a translator), the deprecated
+    # IPv4-compatible ::127.0.0.1, and the SIIT-translated ::ffff:0:a.b.c.d.
+    if ip.version == 6 and any(ip in net for net in _EMBEDS_IPV4):
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+    if not ip.is_global or ip.is_multicast:
+        raise UnsafeURLError(f"refusing {host!r}: resolves to non-public address {ip}")
+
+
 def check_url(url: str, allow_private: bool = True) -> None:
     """Refuse URLs the ingester must never fetch.
 
@@ -348,8 +369,9 @@ def check_url(url: str, allow_private: bool = True) -> None:
     otherwise not globally routable, so a pasted URL cannot reach LiteLLM on
     localhost:4000 or the 169.254.169.254 metadata service. Checking every
     getaddrinfo result matters because a name can resolve to one public and
-    one private address. Residual risk: a DNS-rebinding host could answer
-    differently when urlopen resolves it again; acceptable for a personal tool.
+    one private address. This lookup gives a clear early refusal; http_get checks
+    the address again at connect time, which is what stops DNS rebinding (a host
+    that answers "public" here and "127.0.0.1" when urllib resolves it again).
 
     Args:
         url: The absolute URL about to be fetched (or a redirect target).
@@ -375,14 +397,7 @@ def check_url(url: str, allow_private: bool = True) -> None:
     except (ValueError, OSError) as exc:  # bad port, or the name does not resolve
         raise UnsafeURLError(f"cannot resolve {host!r}: {exc}") from exc
     for info in infos:
-        # IPv6 results can carry a zone suffix ("fe80::1%en0") that ip_address rejects.
-        ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
-        # ::ffff:127.0.0.1 is loopback in disguise; judge the embedded IPv4 address.
-        mapped = getattr(ip, "ipv4_mapped", None)
-        if mapped is not None:
-            ip = mapped
-        if not ip.is_global or ip.is_multicast:
-            raise UnsafeURLError(f"refusing {host!r}: resolves to non-public address {ip}")
+        _require_public(host, info[4][0])
 
 
 class _CheckedRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -409,33 +424,221 @@ class _CheckedRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def http_get(url: str, allow_private: bool = True) -> bytes:
+FETCH_DEADLINE = 120   # seconds for one whole request (connect, headers, redirects, body)
+HTML_TYPES = ("text/html", "application/xhtml+xml", "text/plain")
+
+
+def _public_create_connection(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *_a, **_k):
+    """socket.create_connection that only connects to addresses it has itself checked.
+
+    Resolving here, in the same call that connects, closes the DNS-rebinding gap: check_url's
+    earlier lookup can answer "public" and a second lookup "127.0.0.1".
+    """
+    host, port = address
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    for info in infos:
+        _require_public(host, info[4][0])
+    err: OSError | None = None
+    for family, type_, proto, _, sockaddr in infos:
+        sock = socket.socket(family, type_, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as exc:
+            err = exc
+            sock.close()
+    raise err or OSError(f"no address for {host!r}")
+
+
+class _Deadline:
+    """The wall-clock budget of one http_get, enforced on every socket it opens.
+
+    HTTP_TIMEOUT bounds each socket call, so a server trickling header bytes, or a
+    chain of redirects, could hold a fetch open far past any per-call timeout. Each
+    socket is registered here as it connects; when the budget runs out a timer shuts
+    them all down, which makes the blocked recv return at once. A dup of each socket
+    is kept because https wraps (and detaches) the original before its handshake.
+    """
+
+    def __init__(self, seconds: float):
+        self.end = time.monotonic() + seconds
+        self.expired = False
+        self._socks: list[socket.socket] = []
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(seconds, self._expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    @property
+    def passed(self) -> bool:
+        return self.expired or time.monotonic() >= self.end
+
+    def track(self, sock: socket.socket) -> None:
+        twin = sock.dup()
+        with self._lock:
+            self._socks.append(twin)
+            late = self.expired
+        if late:
+            self._shut(twin)
+
+    def _expire(self) -> None:
+        with self._lock:
+            self.expired = True
+            socks = list(self._socks)
+        for sock in socks:
+            self._shut(sock)
+
+    @staticmethod
+    def _shut(sock: socket.socket) -> None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass   # already closed, or never connected
+
+    def close(self) -> None:
+        self._timer.cancel()
+        with self._lock:
+            socks, self._socks = self._socks, []
+        for sock in socks:
+            sock.close()
+
+
+def _connector(deadline: _Deadline, check_public: bool):
+    """A create_connection that caps the connect at the time left and registers the socket.
+
+    A shutdown cannot interrupt a connect in progress, so the connect timeout itself
+    is cut to whatever remains of the budget.
+    """
+    def create(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *_a, **_k):
+        left = deadline.end - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("fetch deadline passed before connecting")
+        if timeout is socket._GLOBAL_DEFAULT_TIMEOUT or timeout is None or timeout > left:
+            timeout = left
+        connect = _public_create_connection if check_public else socket.create_connection
+        sock = connect(address, timeout, source_address)
+        deadline.track(sock)
+        return sock
+    return create
+
+
+class _TrackedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, *args, connector, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = connector
+
+
+class _TrackedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, *args, connector, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._create_connection = connector
+
+
+class _TrackedHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, connector):
+        super().__init__()
+        self.connector = connector
+
+    def http_open(self, req):
+        return self.do_open(functools.partial(_TrackedHTTPConnection, connector=self.connector), req)
+
+
+class _TrackedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, connector):
+        super().__init__()
+        self.connector = connector
+
+    def https_open(self, req):
+        return self.do_open(functools.partial(_TrackedHTTPSConnection, connector=self.connector), req,
+                            context=self._context)
+
+
+def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...] | None = None) -> bytes:
     """GET a URL and return the body, refusing unsafe targets.
 
     Every fetcher goes through here: the feed, HN, HF papers, and html_index
-    fetchers (fixed public https SOURCES, so allow_private stays True) and
-    fetch_one_url for --add-url (allow_private=False, since the URL is typed
-    by a person or an agent via the wiki-add skill).
+    fetchers (fixed public https SOURCES, so allow_private stays True), and
+    enrich_thin and fetch_one_url (allow_private=False: their URLs come from
+    untrusted feeds or are typed by a person or an agent via the wiki-add skill).
+
+    With allow_private=False the address actually connected to is checked at
+    connect time, on every hop, and no proxy is used (a proxy would do its own,
+    unchecked, resolution). The whole request (connect, headers, every redirect
+    hop, and the body) runs against a wall-clock FETCH_DEADLINE, because
+    HTTP_TIMEOUT bounds each socket call, so a server trickling one byte at a time
+    could otherwise hold the run (and enrich_thin's pool) open forever.
 
     Args:
         url: http or https URL to fetch.
         allow_private: False to also refuse hosts that resolve to loopback,
             private, link-local, or reserved addresses (see check_url).
+        accept_types: When given, refuse any other Content-Type. A PDF decoded
+            as UTF-8 survives extract_prose as kilobytes of mojibake.
 
     Returns:
         The response body, at most MAX_FETCH_BYTES (longer bodies are cut
         and a warning is logged).
 
     Raises:
-        UnsafeURLError: the URL or a redirect target is refused.
-        urllib.error.URLError / HTTPError: the request itself failed.
+        UnsafeURLError: the URL, a redirect target, or the address connected
+            to is refused.
+        urllib.error.URLError / HTTPError: the request failed, including read
+            timeouts, resets, and bodies cut short, which urllib would otherwise
+            raise unwrapped and so past every caller's `except URLError`.
     """
     check_url(url, allow_private)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    # A dedicated opener rather than urlopen so redirects are checked too.
-    opener = urllib.request.build_opener(_CheckedRedirectHandler(allow_private))
-    with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
-        body = resp.read(MAX_FETCH_BYTES + 1)
+    deadline = _Deadline(FETCH_DEADLINE)
+    connector = _connector(deadline, check_public=not allow_private)
+    handlers: list = [_CheckedRedirectHandler(allow_private),
+                      _TrackedHTTPHandler(connector), _TrackedHTTPSHandler(connector)]
+    if not allow_private:
+        handlers.append(urllib.request.ProxyHandler({}))
+    late = f"{url}: no complete response within {FETCH_DEADLINE}s"
+    chunks: list[bytes] = []
+    try:
+        opener = urllib.request.build_opener(*handlers)
+        with opener.open(req, timeout=HTTP_TIMEOUT) as resp:
+            if accept_types is not None:
+                ctype = (resp.headers.get_content_type() or "").lower()
+                if ctype not in accept_types:
+                    raise urllib.error.URLError(f"{url}: content-type {ctype} not fetched")
+            total = 0
+            read = getattr(resp, "read1", resp.read)   # read1 returns after one recv
+            while total <= MAX_FETCH_BYTES:
+                chunk = read(64 * 1024)
+                if not chunk:
+                    # read1 returns b"" at EOF even when Content-Length promised more, where
+                    # read() would raise IncompleteRead; keep a cut-off body a failed fetch.
+                    if getattr(resp, "length", None):
+                        raise urllib.error.URLError(f"{url}: body cut short ({resp.length} bytes missing)")
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if deadline.passed:
+                    raise urllib.error.URLError(late)
+            if deadline.expired:   # the shutdown can look like a clean EOF; a cut body is no body
+                raise urllib.error.URLError(late)
+    except urllib.error.URLError as exc:
+        if deadline.passed:
+            raise urllib.error.URLError(late) from exc
+        if isinstance(exc.reason, UnsafeURLError):
+            # urllib wraps a connect-time refusal in a second URLError; surface the refusal itself.
+            raise exc.reason from None
+        raise
+    except (OSError, http.client.HTTPException) as exc:
+        if deadline.passed:
+            raise urllib.error.URLError(late) from exc
+        # Read timeouts, resets and IncompleteRead escape urllib unwrapped; normalise them so
+        # every caller's `except URLError` really is "this fetch failed", not "abort the run".
+        raise urllib.error.URLError(exc) from exc
+    finally:
+        deadline.close()
+    body = b"".join(chunks)
     if len(body) > MAX_FETCH_BYTES:
         log(f"  WARN {url}: response over {MAX_FETCH_BYTES} bytes, truncated")
         body = body[:MAX_FETCH_BYTES]
@@ -2788,7 +2991,8 @@ def enrich_thin(items: list[Item]) -> int:
 
     def grab(it: Item) -> tuple[Item, str]:
         try:
-            return it, extract_prose(http_get(it.url, allow_private=False).decode("utf-8", errors="replace"))
+            page = http_get(it.url, allow_private=False, accept_types=HTML_TYPES)
+            return it, extract_prose(page.decode("utf-8", errors="replace"))
         except Exception:
             return it, ""
 
@@ -2815,8 +3019,9 @@ def fetch_one_url(url: str, source: str | None) -> Item:
 
     Raises:
         UnsafeURLError: the URL is not http(s) or points at a non-public host.
+        urllib.error.URLError: the fetch failed or the page is not HTML or text.
     """
-    page = http_get(url, allow_private=False).decode("utf-8", errors="replace")
+    page = http_get(url, allow_private=False, accept_types=HTML_TYPES).decode("utf-8", errors="replace")
     prose = extract_prose(page)
     if not prose:  # probably JS-rendered; keep whatever we got
         prose = strip_html(page)[:MAX_BODY_CHARS]
@@ -2848,7 +3053,7 @@ def add_manual(url: str | None, note: str | None, title: str | None,
         log(f"fetching {url}")
         try:
             item = fetch_one_url(url, source)
-        except UnsafeURLError as exc:  # a clear refusal, not a traceback
+        except urllib.error.URLError as exc:  # a refusal or failed fetch: a clear error, not a traceback
             log(f"ERROR {exc.reason}")
             return 1
     else:
@@ -3117,7 +3322,11 @@ def run(args: argparse.Namespace) -> int:
         creds_for_radar = None
     report = radar_scan(wiki_text, creds_for_radar)
     if report.queries:
-        found = fetch_hn_terms(report.queries)
+        try:
+            found = fetch_hn_terms(report.queries)
+        except Exception as exc:   # e.g. a non-dict JSON reply; the radar must not stop the run
+            log(f"WARN radar search failed: {type(exc).__name__}: {str(exc)[:100]}")
+            found = []
         log(f"  radar: searched {report.queries}, {len(found)} hit(s)")
         all_items.extend(found)
     known_urls = archived_urls()
