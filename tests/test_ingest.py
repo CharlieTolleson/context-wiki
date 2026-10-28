@@ -1298,6 +1298,10 @@ def test_coinage_does_not_depend_on_which_spelling_comes_first(monkeypatch):
     for window in ([one, two, three], [two, one, three], [two, three, one]):
         found = {c.key: c.term for c in radar.emerging_terms(window, [], "")}
         assert found.get("codemode") == "codemode"
+    # One item of each spelling, from one source: the README's case (Latent Space alone).
+    other = arch_item("2026-10-04-nw-01", "news", "filler", "")
+    for window in ([one, two, other], [two, one, other]):
+        assert "codemode" in [c.key for c in radar.emerging_terms(window, [], "")], window
 
 
 def test_one_hashtag_does_not_make_an_ordinary_phrase_a_coinage(monkeypatch):
@@ -1327,7 +1331,7 @@ def test_the_baseline_is_searched_with_every_spaced_spelling(monkeypatch):
 def test_an_established_spaced_term_is_not_new_when_also_written_as_one_token(monkeypatch):
     """The baseline is searched with the spaced spelling, which also matches the one-token form."""
     monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS)
-    window = [arch_item("2026-10-02-aa-01", "a", "code mode and codemode", ""),
+    window = [arch_item("2026-10-02-aa-01", "a", "codemode and code mode", ""),   # the order that broke main
               arch_item("2026-10-03-bb-01", "b", "code mode", ""),
               arch_item("2026-10-03-cc-01", "c", "code mode", "")]
     baseline = [arch_item(f"2026-08-0{d}-zz-01", "z", "code mode everywhere", "") for d in range(1, 10)]

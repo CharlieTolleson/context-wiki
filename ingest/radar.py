@@ -191,7 +191,11 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     spaced_items: dict[str, set[int]] = {}      # items that write it as words ("code mode")
     spaced: dict[str, set[str]] = {}            # every multi-word spelling ("open ai agents", "openai agents")
     one_token: dict[str, set[str]] = {}         # every one-token spelling
+    camel_items: dict[str, set[int]] = {}
     for idx, it in enumerate(window):
+        for tok in re.findall(r"#?[A-Za-z][A-Za-z0-9]*", _doc_text(it)):
+            if tok.startswith("#") or re.search(r"[a-z][A-Z]", tok):
+                camel_items.setdefault(collapse(tok), set()).add(idx)
         grams = _ngrams(_doc_text(it))
         title_keys = set(_ngrams(it.title))
         per_item.append((it, grams, title_keys))
@@ -216,8 +220,11 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
         Counting only the one-token items, not every item with the key, keeps a single
         "#PromptCaching" from moving the ordinary phrase "prompt caching" into the lane.
         """
-        return (use_coined and len(one_token_items.get(key, ())) >= MIN_COINED_ITEMS
-                and not is_word(key))
+        ones = one_token_items.get(key, set())
+        # A lowercase one-token spelling ("codemode") is a deliberate coinage; a CamelCase
+        # hashtag ("#PromptCaching") is a phrase written for a tag, so it alone does not count.
+        return (use_coined and bool(ones - camel_items.get(key, set()))
+                and len(seen_items[key]) >= MIN_COINED_ITEMS and not is_word(key))
 
     def display(key: str) -> str:
         """The spelling most items use: the spaced form wins only as a strict majority."""
