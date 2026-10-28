@@ -111,6 +111,11 @@ STATE_PATH = STATE_DIR / "state.json"
 # Item ids backfill has already shown the merge model (cited or deliberately dropped).
 # Without this, dropped items look "pending" forever and get re-picked every pass.
 REVIEWED_PATH = STATE_DIR / "backfill_reviewed.json"
+# Item ids whose merge chunk failed: how often each failed alone, and those given up on (left
+# to --backfill). Only these items jump the per-source queue; see record_merge_failures.
+RETRY_PATH = STATE_DIR / "merge_retry.json"
+MAX_MERGE_FAILURES = 2   # failures in a chunk of its own before an item is given up on
+MAX_SOLO_MERGES = 4      # earlier failures merged one per call in a run; see plan_chunks
 DROPPED_PATH = STATE_DIR / "dropped_claims.jsonl"   # every claim a merge removed, for the recall report
 RECALL_PATH = STATE_DIR / "RECALL.md"               # latest coverage report (local, regenerated each run)
 # Optional separate file for the endpoint credentials, so secrets can live in one shared place.
@@ -252,6 +257,9 @@ class Item:
     published: datetime
     body: str
     item_id: str = ""
+    revived: bool = False   # archived by an earlier run that never merged it (write_archive)
+    retry: bool = False     # and its merge chunk failed then, so it goes first (plan_chunks)
+    refused: bool = False   # a guard rejected it in a chunk of its own (merge_chunked)
 
 
 def log(msg: str) -> None:
@@ -657,6 +665,16 @@ def archived_urls() -> set[str]:
     return urls
 
 
+def finished_urls() -> set[str]:
+    """Archived URLs whose item a merge has already seen (cited or marked reviewed).
+
+    An archived URL that no merge has seen yet (its chunk failed, or a quota held it back)
+    is left out, so a URL-novelty source fetches it again and write_archive re-offers it.
+    """
+    done = merged_ids() | set(load_retry()["gave_up"])
+    return {it.url for it in read_archive() if it.url and it.item_id in done}
+
+
 def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[Item]:
     """Scrape a link-index page whose articles have no feed.
 
@@ -665,11 +683,15 @@ def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[It
     retrieval), and most of it predates any sensible lookback window. The
     watermark would exclude exactly the material we most want. Real publication
     dates are still scraped per-article for attribution.
+
+    Only URLs a merge has already seen are skipped. Skipping every archived URL meant an
+    article whose merge chunk failed was never offered again (holding the watermark does
+    nothing for a source that ignores it).
     """
     base = "https://www.anthropic.com"
     index_html = http_get(url).decode("utf-8", errors="replace")
     slugs = sorted(set(INDEX_LINK_RE.findall(index_html)))
-    already = archived_urls()
+    already = finished_urls()
 
     # The index lists a date beside each link; that is more reliable than
     # scraping the article page, where some posts carry no date at all and the
@@ -945,10 +967,13 @@ def write_archive(items: list[Item], run_date: str) -> Path:
                 # being skipped forever. Otherwise it is finished and is skipped.
                 if archived is None:
                     archived = {a.url: a for a in read_archive() if a.url}
-                    done = merged_ids()
+                    retry = load_retry()
+                    done = merged_ids() | set(retry["gave_up"])
                 prev = archived.get(i.url)
                 if prev and prev.item_id not in done:
                     i.item_id = prev.item_id
+                    i.revived = True
+                    i.retry = prev.item_id in retry["pending"]
                     # The refetch usually carries only the feed's title or teaser, and
                     # enrich_thin skips archived URLs, so without this the merge would see
                     # the thin body, reject it, and the archived full text would never be used.
@@ -1387,9 +1412,15 @@ def select_for_merge(items: list[Item]) -> list[Item]:
     MAX_MERGE_ITEMS. A normal day's fetch is 10 to 30 items plus 20 to 50 papers,
     so a quota that only kicked in above the batch cap let papers flood exactly
     the batches the daily run produces. Items a quota drops stay archived.
+
+    Within a source, items whose merge chunk failed in an earlier run (retry) go first,
+    then newest first. Ranking them by date alone let fresh items push them past the quota,
+    and the source's watermark then advanced without them. Merely "archived but unmerged"
+    is not enough: HF re-reads its watermark day every run, so the papers the quota left
+    out yesterday would otherwise take today's slots on every run.
     """
     buckets: dict[str, list[Item]] = {}
-    for it in sorted(items, key=lambda i: i.published, reverse=True):
+    for it in sorted(items, key=lambda i: (i.retry, i.published), reverse=True):
         buckets.setdefault(it.source, []).append(it)
     # Apply per-source quotas before round-robin so a high-volume source cannot
     # dominate the batch even when other sources are quiet.
@@ -1735,6 +1766,25 @@ def merge_checked(index_md: str, items: list[Item], creds: dict[str, str], hint:
     )
 
 
+def plan_chunks(items: list[Item]) -> list[list[Item]]:
+    """Split a merge batch into chunks: earlier failures alone first, then MERGE_CHUNK at a time.
+
+    The guards reject a whole chunk, so a failed chunk only says that one of its items is
+    bad. An item whose chunk failed in an earlier run (retry) goes in a chunk of its own, and
+    record_merge_failures counts a strike only for an item a guard refused alone, so the
+    chunk-mates of a poisoned item are not given up with it. Bisecting a failed chunk in the
+    same run would find the item sooner but costs about eight calls per bad item; this costs
+    one call per isolated item, in the runs after a failure only. At most MAX_SOLO_MERGES
+    items go alone (oldest first, so none waits forever behind newer ones), so a run makes at
+    most that many extra calls where one failed chunk would otherwise mean fifteen; the rest
+    share chunks as usual and stay pending until a later run isolates them.
+    """
+    solo = sorted((i for i in items if i.retry), key=lambda i: i.published)[:MAX_SOLO_MERGES]
+    alone = {id(i) for i in solo}
+    rest = [i for i in items if id(i) not in alone]
+    return [[i] for i in solo] + [rest[k:k + MERGE_CHUNK] for k in range(0, len(rest), MERGE_CHUNK)]
+
+
 def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
                   hint: str = "") -> tuple[str, list[Item]]:
     """Merge `items` into the wiki MERGE_CHUNK at a time, each chunk against the previous result.
@@ -1742,7 +1792,10 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
     One big prompt overwhelms the merge model: it either rewrites aggressively (tripping the
     guards) or, once corrected, returns the old wiki unchanged. Small chunks keep every call
     inside the range where it reliably integrates new items. A chunk the guards reject is
-    skipped and its items reported as unmerged; the other chunks still land.
+    skipped and its items reported as unmerged; the other chunks still land, and main()
+    holds the watermarks of the unmerged items' sources (hold_watermarks). Up to
+    MAX_SOLO_MERGES items whose chunk failed in an earlier run go first, one per chunk
+    (plan_chunks).
 
     Args:
         index_md: Current wiki text.
@@ -1757,12 +1810,17 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         MergeRejected: Every chunk failed, so nothing was merged.
     """
     current, merged, failures = index_md, [], 0
-    chunks = [items[i:i + MERGE_CHUNK] for i in range(0, len(items), MERGE_CHUNK)]
+    chunks = plan_chunks(items)
+    for i in items:
+        i.refused = False
     for n, chunk in enumerate(chunks, start=1):
         try:
             out = merge_checked(current, chunk, creds, hint=hint)
         except Exception as exc:
             failures += 1
+            # Only a guard refusal of a lone item says the item is bad (record_merge_failures);
+            # a connection error or timeout says nothing about it.
+            chunk[0].refused = len(chunk) == 1 and isinstance(exc, MergeRejected)
             log(f"WARN chunk {n}/{len(chunks)} failed: {type(exc).__name__}: {str(exc)[:160]}")
             continue
         if not out:
@@ -1776,8 +1834,103 @@ def merge_chunked(index_md: str, items: list[Item], creds: dict[str, str],
         raise MergeRejected(f"all {len(chunks)} merge chunk(s) failed")
     if failures:
         log(f"WARN {failures} of {len(chunks)} chunk(s) failed; their items stay archived, unreviewed "
-            "(--backfill will pick them up)")
+            "(main holds their sources' watermarks: hold_watermarks)")
     return current, merged
+
+
+def load_retry() -> dict:
+    """The merge-failure ledger: {"pending": {item_id: failures}, "gave_up": [item_id, ...]}.
+
+    A file of the wrong shape (a list, null, a non-integer count) is treated like an
+    unreadable one: every caller indexes into it, so a hand edit must not crash the run.
+    """
+    try:
+        data = json.loads(RETRY_PATH.read_text()) if RETRY_PATH.exists() else {}
+        pending, gave_up = data.get("pending", {}), data.get("gave_up", [])
+        if not (isinstance(pending, dict) and isinstance(gave_up, list)
+                and all(isinstance(k, str) and type(v) is int for k, v in pending.items())
+                and all(isinstance(k, str) for k in gave_up)):
+            raise ValueError("wrong shape")
+    except (json.JSONDecodeError, OSError, AttributeError, ValueError):
+        log("WARN merge_retry.json unreadable; ignoring it")
+        pending, gave_up = {}, []
+    return {"pending": dict(pending), "gave_up": list(gave_up)}
+
+
+def record_merge_failures(offered: list[Item], merged: list[Item]) -> set[str]:
+    """Count failed merges per item and give up on an item after MAX_MERGE_FAILURES.
+
+    An item whose content reliably trips a guard (an injected "rewrite the whole manual"
+    body, say) would otherwise be refetched and put first every run, costing two merge calls
+    and sinking up to 14 chunk-mates each time, and forever for the Anthropic corpus, which
+    has no lookback window. A given-up item is no longer re-offered or refetched; it stays
+    archived and unreviewed, so --backfill can still take it.
+
+    Only a guard refusal in a chunk of one counts (Item.refused). Items of a failed shared
+    chunk are recorded with no strike, which makes the next run merge each alone
+    (plan_chunks); counting them gave up the innocent neighbours of a bad item after two
+    shared failures. A lone item that failed any other way (APIConnectionError, a timeout,
+    empty output) also gets no strike: the job hit LiteLLM connection errors at merge on
+    2026-10-24 and 10-25, and a two-day outage must not give up every item waiting its turn.
+
+    Returns:
+        Ids given up on in this run, whose sources need no watermark hold for them.
+    """
+    retry = load_retry()
+    merged_now = {i.item_id for i in merged}
+    for item_id in merged_now:
+        retry["pending"].pop(item_id, None)
+    gave_up: set[str] = set()
+    for i in offered:
+        if i.item_id in merged_now:
+            continue
+        if not i.refused:
+            retry["pending"].setdefault(i.item_id, 0)
+            continue
+        n = retry["pending"].pop(i.item_id, 0) + 1
+        if n >= MAX_MERGE_FAILURES:
+            gave_up.add(i.item_id)
+        else:
+            retry["pending"][i.item_id] = n
+    if gave_up:
+        log(f"WARN giving up on {len(gave_up)} item(s) refused alone {MAX_MERGE_FAILURES} times "
+            f"(left for --backfill): {', '.join(sorted(gave_up))[:200]}")
+    retry["gave_up"] = sorted(set(retry["gave_up"]) | gave_up)
+    RETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RETRY_PATH.write_text(json.dumps(retry, indent=2, sort_keys=True) + "\n")
+    return gave_up
+
+
+def hold_watermarks(state: dict, new_state: dict, offered: list[Item], merged: list[Item],
+                    given_up: set[str] = frozenset()) -> list[str]:
+    """Put back the old watermark of every source with an item in a failed merge chunk.
+
+    merge_chunked skips a chunk the guards reject and the rest still land, so main() goes
+    on to save new_state. Without this, every source's watermark advanced past the failed
+    chunk's items: feeds never served them again, so write_archive's re-offer of archived but
+    unmerged URLs never fired, and they were lost to everything but a manual --backfill
+    (audit 2026-10-23). Holding the watermark makes the next run refetch them; items from the
+    same source that did merge are marked reviewed and are skipped then.
+
+    Args:
+        state: Watermarks loaded at the start of the run.
+        new_state: Watermarks about to be saved; updated in place.
+        offered: Items sent to merge_chunked.
+        merged: Items merge_chunked reports as merged.
+        given_up: Failed item ids not to hold for (record_merge_failures gave up on them).
+
+    Returns:
+        Sorted names of the sources whose watermark was held.
+    """
+    merged_ids = {i.item_id for i in merged}
+    held = sorted({i.source for i in offered
+                   if i.item_id not in merged_ids and i.item_id not in given_up and i.source in new_state})
+    for name in held:
+        if name in state:
+            new_state[name] = state[name]
+        else:
+            del new_state[name]
+    return held
 
 
 PRUNE_TARGET = 0.92      # prune to this fraction of WORD_CAP, so the next merge has headroom
@@ -2300,7 +2453,7 @@ def commit(run_date: str, n_items: int, message: str | None = None) -> None:
     if GIT_COMMIT.lower() in ("0", "off", "false", "no"):
         log("git: commits disabled (WIKI_GIT_COMMIT); skipping")
         return
-    paths = [str(p) for p in (INDEX_PATH, ARCHIVE_DIR, TOPICS_DIR, STATE_PATH, REVIEWED_PATH) if p.exists()]
+    paths = [str(p) for p in (INDEX_PATH, ARCHIVE_DIR, TOPICS_DIR, STATE_PATH, REVIEWED_PATH, RETRY_PATH) if p.exists()]
     try:
         inside = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], cwd=WIKI_DIR,
                                 capture_output=True, text=True)
@@ -2494,11 +2647,21 @@ def main() -> int:
     except Exception as exc:
         log(f"ERROR merge failed: {type(exc).__name__}: {str(exc)[:200]}")
         log("archive was written; watermarks NOT advanced so the next run retries these items")
+        # Every chunk failed: record that too, or an item that fails alone is never given
+        # up on and fails the job every day.
+        if isinstance(exc, MergeRejected):
+            record_merge_failures(merge_items, [])
         return 1
 
     if not updated:
         log("ERROR merge returned empty output; leaving INDEX.md untouched")
         return 1
+
+    held = hold_watermarks(state, new_state, merge_items, merged_items,
+                           record_merge_failures(merge_items, merged_items))
+    if held:
+        log(f"WARN watermark held for {', '.join(held)}: a merge chunk with their items failed, "
+            f"so the next run refetches them and merges up to {MAX_SOLO_MERGES} of them alone first")
 
     updated = prune_to_cap(updated, creds)
     write_wiki(updated)

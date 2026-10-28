@@ -43,7 +43,7 @@ import ai_research as a  # noqa: E402
 import radar  # noqa: E402
 
 PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT",
-              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH")
+              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "RETRY_PATH")
 
 
 @contextlib.contextmanager
@@ -61,6 +61,7 @@ def sandbox():
     a.GIT_COMMIT = "auto"
     a.DROPPED_PATH = tmp / "ingest" / "dropped_claims.jsonl"
     a.RECALL_PATH = tmp / "ingest" / "RECALL.md"
+    a.RETRY_PATH = tmp / "ingest" / "merge_retry.json"
     a.WATCHLIST_PATH = tmp / "watchlist.txt"      # absent unless a test writes one
     (tmp / "ingest").mkdir()
     try:
@@ -575,14 +576,14 @@ def test_html_index_dates_bind_to_their_own_card():
     assert {p: d.date().isoformat() for p, d in got.items()} == {p: iso for p, _, _, iso in cards}
 
     # and through the fetcher, with the network stubbed and an empty archive
-    real_get, real_archived = a.http_get, a.archived_urls
-    a.http_get, a.archived_urls = fake_get, lambda: set()
+    real_get = a.http_get
+    a.http_get = fake_get
     try:
         with sandbox():
             items = a.fetch_html_index("anthropic-eng", "ae", "https://www.anthropic.com/engineering",
                                        datetime(2000, 1, 1, tzinfo=timezone.utc))
     finally:
-        a.http_get, a.archived_urls = real_get, real_archived
+        a.http_get = real_get
     by_url = {i.url: i for i in items}
     assert len(by_url) == 3
     for p, title, _, iso in cards:
@@ -872,6 +873,215 @@ def test_accepted_merges_log_the_claims_they_removed():
 
 
 # ── chunked merge and pruning ───────────────────────────────────────────────
+
+
+def test_hold_watermarks_keeps_old_watermark_for_sources_in_a_failed_chunk():
+    """A source with an unmerged item keeps its old watermark (or none); fully merged sources advance."""
+    def it(source: str, n: int) -> a.Item:
+        i = a.Item(source, "ab", "t", f"https://x/{source}/{n}", datetime.now(timezone.utc), "body")
+        i.item_id = f"2026-01-01-ab-{source}-{n}"
+        return i
+    offered = [it("blog", 1), it("blog", 2), it("feed", 1), it("newsrc", 1), it("hn-radar", 1)]
+    merged = [offered[0], offered[2]]                     # blog/2, newsrc/1, hn-radar/1 failed
+    state = {"blog": "2026-01-01T00:00:00+00:00", "feed": "2026-01-01T00:00:00+00:00"}
+    new_state = {"blog": "NOW", "feed": "NOW", "newsrc": "NOW"}
+    held = a.hold_watermarks(state, new_state, offered, merged)
+    assert held == ["blog", "newsrc"]                     # hn-radar has no watermark to hold
+    assert new_state == {"blog": state["blog"], "feed": "NOW"}
+
+
+def test_html_index_refetches_archived_urls_no_merge_has_seen():
+    """An archived but unmerged corpus article is fetched again; a cited or reviewed one is not."""
+    with sandbox():
+        when = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        pending, cited, reviewed = (a.Item("anthropic-eng", "ae", t, f"https://www.anthropic.com/engineering/{t}",
+                                           when, "body") for t in ("pending", "cited", "reviewed"))
+        a.write_archive([pending, cited, reviewed], "2026-01-01")
+        a.INDEX_PATH.write_text(f"## S\n\n- a practice - anthropic-eng, 2026-01-01 [{cited.item_id}]\n")
+        a.mark_reviewed([reviewed.item_id])
+        assert a.finished_urls() == {cited.url, reviewed.url}
+
+
+def test_select_for_merge_puts_reoffered_items_ahead_of_new_ones_within_quota():
+    """A paper re-offered after a failed chunk is not pushed past the quota by newer papers."""
+    now = datetime.now(timezone.utc)
+    fresh = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(hours=n), "b")
+             for n in range(5)]
+    old = a.Item("hf-daily-papers", "hf", "old", "https://x/old", now - timedelta(days=3), "b", retry=True)
+    picked = a.select_for_merge(fresh + [old])
+    assert old in picked and len(picked) == a.SOURCE_QUOTA["hf-daily-papers"]
+
+
+def test_quota_leftovers_reread_from_yesterday_do_not_take_new_slots():
+    """HF re-reads its watermark day: yesterday's unmerged papers are revived, not retried."""
+    now = datetime.now(timezone.utc)
+    with sandbox():
+        old = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(days=1, hours=n), "b")
+               for n in range(10)]
+        a.write_archive(old, "2026-01-01")
+        a.mark_reviewed([i.item_id for i in old[:3]])           # yesterday's quota merged p0..p2
+        again = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(days=1, hours=n), "b")
+                 for n in range(10)]
+        new = [a.Item("hf-daily-papers", "hf", f"q{n}", f"https://x/q{n}", now - timedelta(hours=n), "b")
+               for n in range(5)]
+        a.write_archive(again + new, "2026-01-02")
+        offered = [i for i in again if i.revived] + new
+        assert not any(i.retry for i in offered)
+        assert [i.title for i in a.select_for_merge(offered)] == ["q0", "q1", "q2"]
+
+
+def test_record_merge_failures_retries_then_gives_up():
+    """A failed item is retried first; after MAX_MERGE_FAILURES failures alone it is left for --backfill."""
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with sandbox():
+        bad = a.Item("anthropic-eng", "ae", "bad", "https://www.anthropic.com/engineering/bad", now, "b")
+        good = a.Item("anthropic-eng", "ae", "good", "https://www.anthropic.com/engineering/good", now, "b")
+        a.write_archive([bad, good], "2026-01-01")
+        assert a.record_merge_failures([bad, good], [good]) == set()
+        assert a.load_retry()["pending"] == {bad.item_id: 0}         # a shared chunk is no strike
+        again = a.Item("anthropic-eng", "ae", "bad", bad.url, now, "b")
+        a.write_archive([again], "2026-01-02")
+        assert again.retry and again.item_id == bad.item_id
+        again.refused = True                                        # as merge_chunked marks a lone guard refusal
+        assert a.record_merge_failures([again], []) == set()
+        assert a.record_merge_failures([again], []) == {bad.item_id}
+        assert bad.url in a.finished_urls()                         # no longer refetched
+        third = a.Item("anthropic-eng", "ae", "bad", bad.url, now, "b")
+        a.write_archive([third], "2026-01-03")
+        assert not third.revived                                    # nor re-offered
+        state, new_state = {"anthropic-eng": "OLD"}, {"anthropic-eng": "NOW"}
+        assert a.hold_watermarks(state, new_state, [again], [], {bad.item_id}) == []
+
+
+def test_a_poisoned_item_does_not_get_its_chunk_mates_given_up():
+    """Shared failures only isolate items; the bad one is struck alone and its neighbours merge."""
+    items = [item("ab", f"https://x/{n}", title=f"t{n}") for n in range(a.MERGE_CHUNK)]
+    for n, i in enumerate(items):
+        i.item_id = f"2026-01-01-ab-{n:02d}"
+    items[3].title = "POISON"
+    calls: list[int] = []
+    real = a.merge_checked
+
+    def fake(index_md, chunk, creds, hint="", retries=1):
+        calls.append(len(chunk))
+        if any(i.title == "POISON" for i in chunk):
+            raise a.MergeRejected("guard")
+        return index_md + "x"
+    try:
+        a.merge_checked = fake
+        with sandbox(), capture_logs():
+            done: set[str] = set()
+            for _ in range(12):                                     # one daily run per pass
+                offered = [i for i in items if i.item_id not in done | set(a.load_retry()["gave_up"])]
+                if not offered:
+                    break
+                pending = a.load_retry()["pending"]
+                for i in offered:
+                    i.retry = i.item_id in pending
+                calls.clear()
+                try:
+                    merged = a.merge_chunked("## S\n", offered, {})[1]
+                except a.MergeRejected:
+                    merged = []
+                assert len(calls) <= a.MAX_SOLO_MERGES + 1          # bounded LLM calls per run
+                a.record_merge_failures(offered, merged)
+                done |= {i.item_id for i in merged}
+            assert a.load_retry() == {"pending": {}, "gave_up": [items[3].item_id]}
+            assert done == {i.item_id for i in items if i is not items[3]}
+    finally:
+        a.merge_checked = real
+
+
+def test_a_lone_item_that_fails_on_a_connection_error_is_not_given_up():
+    """Only a guard refusal is a strike: an outage on two runs leaves the waiting item pending."""
+    lone = item("ab", "https://x/lone")
+    lone.item_id, lone.retry = "2026-01-01-ab-01", True
+    real = a.merge_checked
+
+    def outage(index_md, chunk, creds, hint="", retries=1):
+        raise ConnectionError("APIConnectionError: Connection error.")
+    try:
+        a.merge_checked = outage
+        with sandbox(), capture_logs():
+            for _ in range(a.MAX_MERGE_FAILURES + 1):
+                try:
+                    a.merge_chunked("## S\n", [lone], {})
+                    raise AssertionError("expected MergeRejected")
+                except a.MergeRejected:
+                    pass
+                assert not lone.refused
+                assert a.record_merge_failures([lone], []) == set()
+            assert a.load_retry() == {"pending": {lone.item_id: 0}, "gave_up": []}
+            a.merge_checked = lambda *args, **kw: (_ for _ in ()).throw(a.MergeRejected("guard"))
+            try:
+                a.merge_chunked("## S\n", [lone], {})
+            except a.MergeRejected:
+                pass
+            assert lone.refused and a.load_retry()["pending"][lone.item_id] == 0
+            assert a.record_merge_failures([lone], []) == set()
+            assert a.load_retry()["pending"] == {lone.item_id: 1}
+    finally:
+        a.merge_checked = real
+
+
+def test_plan_chunks_isolates_earlier_failures_oldest_first_up_to_the_cap():
+    """Retried items go alone, oldest first, at most MAX_SOLO_MERGES; the rest chunk as usual."""
+    now = datetime.now(timezone.utc)
+    items = [a.Item("src", "ab", f"t{n}", f"https://x/{n}", now - timedelta(hours=n), "b", retry=n < 6)
+             for n in range(20)]
+    chunks = a.plan_chunks(items)
+    solo = [c[0].title for c in chunks[:a.MAX_SOLO_MERGES]]
+    assert solo == ["t5", "t4", "t3", "t2"] and all(len(c) == 1 for c in chunks[:a.MAX_SOLO_MERGES])
+    assert [len(c) for c in chunks[a.MAX_SOLO_MERGES:]] == [a.MERGE_CHUNK, 20 - a.MAX_SOLO_MERGES - a.MERGE_CHUNK]
+    assert a.plan_chunks(items[6:]) == [items[6:]]                  # no retries: plain chunking
+
+
+def test_load_retry_falls_back_to_empty_on_a_wrong_shape():
+    """A list, null, or a non-integer count in merge_retry.json warns and reads as an empty ledger."""
+    with sandbox():
+        for bad in ("[]", "null", '{"pending": {"x": "1"}, "gave_up": []}', '{"pending": [], "gave_up": []}',
+                    '{"pending": {}, "gave_up": {"x": 1}}', '{"pending": {"x": true}}', "{oops"):
+            a.RETRY_PATH.write_text(bad)
+            with capture_logs() as lines:
+                assert a.load_retry() == {"pending": {}, "gave_up": []}, bad
+            assert any("merge_retry.json unreadable" in ln for ln in lines), bad
+        a.RETRY_PATH.write_text('{"pending": {"x": 1}, "gave_up": ["y"]}')
+        assert a.load_retry() == {"pending": {"x": 1}, "gave_up": ["y"]}
+
+
+def test_main_gives_up_on_an_item_that_fails_alone_every_run():
+    """When every chunk fails the failures are still recorded, so a lone poisoned item stops failing the job."""
+    now = datetime.now(timezone.utc)
+    names = ("SOURCES", "FETCHERS", "merge_checked", "load_env", "radar_scan", "enrich_thin",
+             "prune_to_cap", "commit", "lint_index")
+    saved = {n: getattr(a, n) for n in names}, sys.argv
+
+    def fetch(name, slug, url, since):
+        return [a.Item(name, slug, "POISON", "https://x/poison", now - timedelta(hours=1), "body " * 200)]
+
+    def reject(index_md, chunk, creds, hint="", retries=1):
+        raise a.MergeRejected("guard")
+    try:
+        a.SOURCES = [("blog", "bl", "stub", "https://x/feed")]
+        a.FETCHERS = {"stub": fetch}
+        a.merge_checked = reject
+        a.load_env = lambda: {}
+        a.radar_scan = lambda wiki, creds: a.RadarReport([], [], [])
+        a.enrich_thin = lambda items: None
+        a.prune_to_cap = lambda md, creds: md
+        a.commit = lambda *args: None
+        a.lint_index = lambda *args, **kw: None
+        sys.argv = ["ai_research.py"]
+        with sandbox(), capture_logs():
+            a.INDEX_PATH.write_text("## S\n\n- seed - s, 2026-01-01 [2025-01-01-zz-01]\n")
+            codes = [a.main() for _ in range(a.MAX_MERGE_FAILURES)]
+            assert codes == [1] * a.MAX_MERGE_FAILURES
+            assert len(a.load_retry()["gave_up"]) == 1
+            assert a.main() == 0
+    finally:
+        for n, v in saved[0].items():
+            setattr(a, n, v)
+        sys.argv = saved[1]
 
 
 def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
