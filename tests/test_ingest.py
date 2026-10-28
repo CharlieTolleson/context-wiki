@@ -15,6 +15,7 @@ Lint checks citations against the archive (fabricated ids, changed dates, bodile
 The merge prompt's untrusted block neutralises delimiter variants and spoofed item headers.
 The merge output guard rejects added HTML and id-less bullets; lint reports URLs and shell pipes.
 Small merge batches are quota-capped per source, and the HF papers fetcher selects by listing day.
+The radar filter's reply parser accepts candidate numbers or listed terms, fenced or not.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -44,7 +45,7 @@ import ai_research as a  # noqa: E402
 import radar  # noqa: E402
 
 PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT",
-              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH")
+              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "RETRY_PATH")
 
 
 @contextlib.contextmanager
@@ -62,6 +63,7 @@ def sandbox():
     a.GIT_COMMIT = "auto"
     a.DROPPED_PATH = tmp / "ingest" / "dropped_claims.jsonl"
     a.RECALL_PATH = tmp / "ingest" / "RECALL.md"
+    a.RETRY_PATH = tmp / "ingest" / "merge_retry.json"
     a.WATCHLIST_PATH = tmp / "watchlist.txt"      # absent unless a test writes one
     (tmp / "ingest").mkdir()
     try:
@@ -227,7 +229,7 @@ def test_output_guard_passes_code_prompt_tags_wrapped_claims_and_old_findings():
 
     try:
         a.merge_index = once(good)
-        assert a.merge_checked(old, [], {}) == good and len(calls) == 1
+        assert a.merge_checked(old, [], {}) == a.unwrap_claims(good) and len(calls) == 1  # claims are joined to one line (#21)
         assert a.unsafe_output(good) == []
         calls.clear(); a.merge_index = once(legacy)
         assert a.merge_checked(legacy, [], {}) == legacy and len(calls) == 1
@@ -319,6 +321,107 @@ def test_merge_checked_accepts_an_unchanged_legacy_wiki_plus_one_cited_claim_fir
     finally:
         a.merge_index = real
     assert "claim with no item id" in a.MERGE_SYSTEM and "Never reword it" in a.MERGE_SYSTEM
+
+
+def _merge_reply(content: str, finish_reason: str = "stop") -> str:
+    """Run merge_index against a fake OpenAI client that serves one reply."""
+    import openai
+
+    class FakeClient:
+        def __init__(self, **kw):
+            self.chat = type("C", (), {"completions": self})()
+
+        def create(self, **kw):
+            msg = type("M", (), {"content": content})()
+            choice = type("Ch", (), {"message": msg, "finish_reason": finish_reason})()
+            return type("R", (), {"choices": [choice], "model": "fake"})()
+    real = openai.OpenAI
+    openai.OpenAI = FakeClient
+    try:
+        return a.merge_index("## S\n\n- old [2026-01-01-ab-01]\n", [], {"base_url": "x", "api_key": "y"})
+    finally:
+        openai.OpenAI = real
+
+
+def test_merge_index_discards_a_reply_cut_at_max_tokens():
+    """A truncated reply could pass the shrink guard, so it comes back empty (chunk failed)."""
+    wiki = doc(47)
+    assert _merge_reply(wiki, finish_reason="length") == ""
+    assert _merge_reply(wiki) == wiki.strip()
+
+
+def test_merge_index_unwraps_a_fenced_reply_and_drops_trailing_prose():
+    """Prose around a fenced wiki is not stored; code blocks and inline code inside it survive."""
+    wiki = ("## S\n\n- Call `tool()` once [2026-01-01-ab-01]\n\n```python\nx = 1\n```\n\n"
+            "- Second claim [2026-01-01-ab-02]")
+    assert _merge_reply(f"```markdown\n{wiki}\n```\n\nLet me know if you want changes.") == wiki
+    assert _merge_reply(f"Here is the wiki:\n```markdown\n{wiki}\n```\nDone.") == wiki
+    assert _merge_reply(f"```\n{wiki}\n```") == wiki
+    assert _merge_reply(wiki) == wiki                 # unfenced reply: code block untouched
+    bare = "## S\n\n- One [2026-01-01-ab-01]\n\n```\nx = 1\n```\n\n- Two [2026-01-01-ab-02]"
+    assert _merge_reply(f"```markdown\n{bare}\n```") == bare   # a bare inner block survives
+    assert _merge_reply(f"Here is the wiki:\n```\n{wiki}\n```") == wiki
+
+
+def test_merge_index_keeps_an_unfenced_wiki_holding_a_markdown_block():
+    """A ```markdown example inside an unfenced wiki is not mistaken for a wrapper."""
+    wiki = ("## Context\n\n- Keep CLAUDE.md short [2026-01-01-ab-01]\n- Example:\n\n"
+            "```markdown\n# Project\n- run tests\n```\n\n## Evals\n\n- Grade transcripts [2026-01-01-ab-02]")
+    assert _merge_reply(wiki) == wiki
+
+
+def test_merge_index_drops_trailing_prose_that_holds_its_own_fence():
+    """The wrapper closes at the first unpaired fence, not the last one in the reply."""
+    wiki = "## S\n\n- x [2026-01-01-ab-01]"
+    assert _merge_reply(f"```markdown\n{wiki}\n```\nChanges:\n```diff\n+ x\n```") == wiki
+
+
+def test_unwrap_keeps_an_unfenced_wiki_that_opens_with_a_code_block():
+    """A leading bare block (or a ```markdown example after a line of prose) is not a wrapper."""
+    wiki = "# M\n\n## S\n" + "".join(f"- c{i} [2026-01-01-ab-0{i}]\n" for i in range(5))
+    reply = "```\npip install foo\n```\n" + wiki
+    assert a.unwrap_reply(reply) == reply.strip()
+    reply = "Intro.\n```markdown\n# P\n- run tests\n```\n" + wiki
+    assert a.unwrap_reply(reply) == reply.strip()
+
+
+def test_unwrap_does_not_cut_the_last_section_at_a_bare_inner_block():
+    """Claims after a bare inner block keep the wrapper open, whatever their bullet or heading style."""
+    wiki = ("# M\n\n## Tools\n\n- one [2026-01-01-ab-01]\n  ```\n  cfg\n  ```\n"
+            "  - nested [2026-01-01-ab-02]\n* star [2026-01-01-ab-03]\n### Sub\nText")
+    assert a.unwrap_reply(f"```markdown\n{wiki}\n```") == wiki
+    wiki = "## S\n- one [2026-01-01-ab-01]\n```\nx=1\n```\n- uncited bullet"
+    assert a.unwrap_reply(f"```markdown\n{wiki}\n```") == wiki
+
+
+def test_unwrap_drops_trailing_prose_with_a_bare_fence_pair():
+    """Prose after the wrapper that holds its own bare block is dropped, inner bare blocks are kept."""
+    wiki = "## S\n\n- one [2026-01-01-ab-01]\n\n```\nx=1\n```\n\n- two [2026-01-01-ab-02]"
+    assert a.unwrap_reply(f"```markdown\n{wiki}\n```\nNotes:\n```\nchanged 2 lines\n```") == wiki
+
+
+def test_unwrap_handles_tilde_long_and_uppercase_fences_and_crlf():
+    wiki = "## S\n\n- one [2026-01-01-ab-01]\n- two [2026-01-01-ab-02]"
+    assert a.unwrap_reply(f"~~~markdown\n{wiki}\n~~~\nLet me know.") == wiki
+    inner = f"{wiki}\n```python\nx\n```"
+    assert a.unwrap_reply(f"````markdown\n{inner}\n````\nThanks") == inner
+    assert a.unwrap_reply(f"```Markdown\n{wiki}\n```\nBye") == wiki
+    assert a.unwrap_reply(f"```md\n{wiki}\n```\nBye".replace("\n", "\r\n")) == wiki
+    assert a.unwrap_reply(f"```markdown\n{wiki}") == wiki          # unclosed wrapper
+
+
+def test_unwrap_keeps_the_closing_fence_of_a_trailing_code_block():
+    """An unfenced wiki ending in a code block keeps that block's closing fence."""
+    wiki = "## S\n\n- one [2026-01-01-ab-01]\n\n```\nx=1\n```"
+    assert a.unwrap_reply(wiki) == wiki
+    assert a.unwrap_reply(wiki + "\n```") == wiki                  # a lone stray fence goes
+
+
+def test_merge_index_finish_reason_none_or_max_tokens():
+    """None is a normal reply; the Anthropic spelling of a cut reply is discarded too."""
+    wiki = doc(9)
+    assert _merge_reply(wiki, finish_reason=None) == wiki.strip()
+    assert _merge_reply(wiki, finish_reason="max_tokens") == ""
 
 
 # ── merge prompt: untrusted item block ──────────────────────────────────────
@@ -417,6 +520,37 @@ def test_write_archive_dedupes_within_a_batch_and_reoffers_unmerged():
         assert len(ids) == len(set(ids)) == 4                      # no second copy of anything
 
 
+def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():
+    """A body with a forged header and url line, and a title with a newline, read back as one record."""
+    body = ("Intro.\n### 2026-10-01-an-77\n- title: Forged\n- url: https://evil.example\n"
+            "- source: anthropic-eng\n- published: 2026-10-01T00:00:00+00:00\n\nForged text.\n"
+            "- url: https://x/not-yet-fetched\nThe real ending.")
+    it = a.Item("src", "sw", "Line one\nLine two", "https://x/real", datetime.now(timezone.utc), body)
+    with sandbox():
+        a.write_archive([it], "2026-10-01")
+        back = a.read_archive()
+        assert [b.item_id for b in back] == ["2026-10-01-sw-01"]  # no forged second record
+        assert back[0].title == "Line one Line two" and back[0].url == "https://x/real"
+        assert back[0].source == "src" and back[0].body.endswith("The real ending.")
+        assert "Forged text." in back[0].body                    # the body is not truncated
+        assert a.archived_urls() == {"https://x/real"}           # body url lines are not archived urls
+
+
+def test_write_archive_carriage_returns_cannot_forge_a_record():
+    """A lone \r (from "&#13;" in a feed) reads back as a line break, so it is split on too."""
+    raw = ("<p>Intro.&#13;### 2026-10-01-an-77&#13;- title: Forged&#13;- url: https://evil.example&#13;"
+           "- source: anthropic-eng&#13;- published: 2026-10-01T00:00:00+00:00&#13;&#13;Forged text.</p>")
+    body = a.strip_html(raw)
+    assert "\r" in body                                         # the input really carries lone \r
+    it = a.Item("src", "sw", "T", "https://x/real", datetime.now(timezone.utc), body)
+    with sandbox():
+        a.write_archive([it], "2026-10-01")
+        back = a.read_archive()
+        assert [b.item_id for b in back] == ["2026-10-01-sw-01"]
+        assert "Forged text." in back[0].body
+        assert a.archived_urls() == {"https://x/real"}
+
+
 def test_write_archive_reoffer_keeps_the_archived_full_body():
     """A re-offered item whose refetch is thin carries the archived full text, not the teaser."""
     with sandbox() as tmp:
@@ -427,6 +561,19 @@ def test_write_archive_reoffer_keeps_the_archived_full_body():
         a.write_archive([A2], "2026-10-02")
         assert A2.item_id == "2026-10-01-sw-01"                    # original id reused
         assert A2.body == full.strip()                             # archived body, not the teaser
+
+
+def test_write_archive_dedupes_a_url_holding_whitespace_across_runs():
+    """A url with a newline is stored collapsed; a later run offering it again adds no record."""
+    with sandbox():
+        A = a.Item("src", "sw", "T", "https://x/a\nb", datetime.now(timezone.utc), "B")
+        assert A.url == "https://x/a b"                             # normalised once, at construction
+        a.write_archive([A], "2026-10-01")
+        a.INDEX_PATH.write_text(f"## S\n\n- claim [{A.item_id}]\n")    # merged
+        A2 = a.Item("src", "sw", "T", "https://x/a\nb", datetime.now(timezone.utc), "B")
+        a.write_archive([A2], "2026-10-02")
+        assert A2.item_id == ""                                    # skipped, not archived again
+        assert [b.item_id for b in a.read_archive()] == ["2026-10-01-sw-01"]
 
 
 # ── git commit scoping ──────────────────────────────────────────────────────
@@ -646,14 +793,14 @@ def test_html_index_dates_bind_to_their_own_card():
     assert {p: d.date().isoformat() for p, d in got.items()} == {p: iso for p, _, _, iso in cards}
 
     # and through the fetcher, with the network stubbed and an empty archive
-    real_get, real_archived = a.http_get, a.archived_urls
-    a.http_get, a.archived_urls = fake_get, lambda: set()
+    real_get = a.http_get
+    a.http_get = fake_get
     try:
         with sandbox():
             items = a.fetch_html_index("anthropic-eng", "ae", "https://www.anthropic.com/engineering",
                                        datetime(2000, 1, 1, tzinfo=timezone.utc))
     finally:
-        a.http_get, a.archived_urls = real_get, real_archived
+        a.http_get = real_get
     by_url = {i.url: i for i in items}
     assert len(by_url) == 3
     for p, title, _, iso in cards:
@@ -945,6 +1092,215 @@ def test_accepted_merges_log_the_claims_they_removed():
 # ── chunked merge and pruning ───────────────────────────────────────────────
 
 
+def test_hold_watermarks_keeps_old_watermark_for_sources_in_a_failed_chunk():
+    """A source with an unmerged item keeps its old watermark (or none); fully merged sources advance."""
+    def it(source: str, n: int) -> a.Item:
+        i = a.Item(source, "ab", "t", f"https://x/{source}/{n}", datetime.now(timezone.utc), "body")
+        i.item_id = f"2026-01-01-ab-{source}-{n}"
+        return i
+    offered = [it("blog", 1), it("blog", 2), it("feed", 1), it("newsrc", 1), it("hn-radar", 1)]
+    merged = [offered[0], offered[2]]                     # blog/2, newsrc/1, hn-radar/1 failed
+    state = {"blog": "2026-01-01T00:00:00+00:00", "feed": "2026-01-01T00:00:00+00:00"}
+    new_state = {"blog": "NOW", "feed": "NOW", "newsrc": "NOW"}
+    held = a.hold_watermarks(state, new_state, offered, merged)
+    assert held == ["blog", "newsrc"]                     # hn-radar has no watermark to hold
+    assert new_state == {"blog": state["blog"], "feed": "NOW"}
+
+
+def test_html_index_refetches_archived_urls_no_merge_has_seen():
+    """An archived but unmerged corpus article is fetched again; a cited or reviewed one is not."""
+    with sandbox():
+        when = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        pending, cited, reviewed = (a.Item("anthropic-eng", "ae", t, f"https://www.anthropic.com/engineering/{t}",
+                                           when, "body") for t in ("pending", "cited", "reviewed"))
+        a.write_archive([pending, cited, reviewed], "2026-01-01")
+        a.INDEX_PATH.write_text(f"## S\n\n- a practice - anthropic-eng, 2026-01-01 [{cited.item_id}]\n")
+        a.mark_reviewed([reviewed.item_id])
+        assert a.finished_urls() == {cited.url, reviewed.url}
+
+
+def test_select_for_merge_puts_reoffered_items_ahead_of_new_ones_within_quota():
+    """A paper re-offered after a failed chunk is not pushed past the quota by newer papers."""
+    now = datetime.now(timezone.utc)
+    fresh = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(hours=n), "b")
+             for n in range(5)]
+    old = a.Item("hf-daily-papers", "hf", "old", "https://x/old", now - timedelta(days=3), "b", retry=True)
+    picked = a.select_for_merge(fresh + [old])
+    assert old in picked and len(picked) == a.SOURCE_QUOTA["hf-daily-papers"]
+
+
+def test_quota_leftovers_reread_from_yesterday_do_not_take_new_slots():
+    """HF re-reads its watermark day: yesterday's unmerged papers are revived, not retried."""
+    now = datetime.now(timezone.utc)
+    with sandbox():
+        old = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(days=1, hours=n), "b")
+               for n in range(10)]
+        a.write_archive(old, "2026-01-01")
+        a.mark_reviewed([i.item_id for i in old[:3]])           # yesterday's quota merged p0..p2
+        again = [a.Item("hf-daily-papers", "hf", f"p{n}", f"https://x/p{n}", now - timedelta(days=1, hours=n), "b")
+                 for n in range(10)]
+        new = [a.Item("hf-daily-papers", "hf", f"q{n}", f"https://x/q{n}", now - timedelta(hours=n), "b")
+               for n in range(5)]
+        a.write_archive(again + new, "2026-01-02")
+        offered = [i for i in again if i.revived] + new
+        assert not any(i.retry for i in offered)
+        assert [i.title for i in a.select_for_merge(offered)] == ["q0", "q1", "q2"]
+
+
+def test_record_merge_failures_retries_then_gives_up():
+    """A failed item is retried first; after MAX_MERGE_FAILURES failures alone it is left for --backfill."""
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    with sandbox():
+        bad = a.Item("anthropic-eng", "ae", "bad", "https://www.anthropic.com/engineering/bad", now, "b")
+        good = a.Item("anthropic-eng", "ae", "good", "https://www.anthropic.com/engineering/good", now, "b")
+        a.write_archive([bad, good], "2026-01-01")
+        assert a.record_merge_failures([bad, good], [good]) == set()
+        assert a.load_retry()["pending"] == {bad.item_id: 0}         # a shared chunk is no strike
+        again = a.Item("anthropic-eng", "ae", "bad", bad.url, now, "b")
+        a.write_archive([again], "2026-01-02")
+        assert again.retry and again.item_id == bad.item_id
+        again.refused = True                                        # as merge_chunked marks a lone guard refusal
+        assert a.record_merge_failures([again], []) == set()
+        assert a.record_merge_failures([again], []) == {bad.item_id}
+        assert bad.url in a.finished_urls()                         # no longer refetched
+        third = a.Item("anthropic-eng", "ae", "bad", bad.url, now, "b")
+        a.write_archive([third], "2026-01-03")
+        assert not third.revived                                    # nor re-offered
+        state, new_state = {"anthropic-eng": "OLD"}, {"anthropic-eng": "NOW"}
+        assert a.hold_watermarks(state, new_state, [again], [], {bad.item_id}) == []
+
+
+def test_a_poisoned_item_does_not_get_its_chunk_mates_given_up():
+    """Shared failures only isolate items; the bad one is struck alone and its neighbours merge."""
+    items = [item("ab", f"https://x/{n}", title=f"t{n}") for n in range(a.MERGE_CHUNK)]
+    for n, i in enumerate(items):
+        i.item_id = f"2026-01-01-ab-{n:02d}"
+    items[3].title = "POISON"
+    calls: list[int] = []
+    real = a.merge_checked
+
+    def fake(index_md, chunk, creds, hint="", retries=1):
+        calls.append(len(chunk))
+        if any(i.title == "POISON" for i in chunk):
+            raise a.MergeRejected("guard")
+        return index_md + "x"
+    try:
+        a.merge_checked = fake
+        with sandbox(), capture_logs():
+            done: set[str] = set()
+            for _ in range(12):                                     # one daily run per pass
+                offered = [i for i in items if i.item_id not in done | set(a.load_retry()["gave_up"])]
+                if not offered:
+                    break
+                pending = a.load_retry()["pending"]
+                for i in offered:
+                    i.retry = i.item_id in pending
+                calls.clear()
+                try:
+                    merged = a.merge_chunked("## S\n", offered, {})[1]
+                except a.MergeRejected:
+                    merged = []
+                assert len(calls) <= a.MAX_SOLO_MERGES + 1          # bounded LLM calls per run
+                a.record_merge_failures(offered, merged)
+                done |= {i.item_id for i in merged}
+            assert a.load_retry() == {"pending": {}, "gave_up": [items[3].item_id]}
+            assert done == {i.item_id for i in items if i is not items[3]}
+    finally:
+        a.merge_checked = real
+
+
+def test_a_lone_item_that_fails_on_a_connection_error_is_not_given_up():
+    """Only a guard refusal is a strike: an outage on two runs leaves the waiting item pending."""
+    lone = item("ab", "https://x/lone")
+    lone.item_id, lone.retry = "2026-01-01-ab-01", True
+    real = a.merge_checked
+
+    def outage(index_md, chunk, creds, hint="", retries=1):
+        raise ConnectionError("APIConnectionError: Connection error.")
+    try:
+        a.merge_checked = outage
+        with sandbox(), capture_logs():
+            for _ in range(a.MAX_MERGE_FAILURES + 1):
+                try:
+                    a.merge_chunked("## S\n", [lone], {})
+                    raise AssertionError("expected MergeRejected")
+                except a.MergeRejected:
+                    pass
+                assert not lone.refused
+                assert a.record_merge_failures([lone], []) == set()
+            assert a.load_retry() == {"pending": {lone.item_id: 0}, "gave_up": []}
+            a.merge_checked = lambda *args, **kw: (_ for _ in ()).throw(a.MergeRejected("guard"))
+            try:
+                a.merge_chunked("## S\n", [lone], {})
+            except a.MergeRejected:
+                pass
+            assert lone.refused and a.load_retry()["pending"][lone.item_id] == 0
+            assert a.record_merge_failures([lone], []) == set()
+            assert a.load_retry()["pending"] == {lone.item_id: 1}
+    finally:
+        a.merge_checked = real
+
+
+def test_plan_chunks_isolates_earlier_failures_oldest_first_up_to_the_cap():
+    """Retried items go alone, oldest first, at most MAX_SOLO_MERGES; the rest chunk as usual."""
+    now = datetime.now(timezone.utc)
+    items = [a.Item("src", "ab", f"t{n}", f"https://x/{n}", now - timedelta(hours=n), "b", retry=n < 6)
+             for n in range(20)]
+    chunks = a.plan_chunks(items)
+    solo = [c[0].title for c in chunks[:a.MAX_SOLO_MERGES]]
+    assert solo == ["t5", "t4", "t3", "t2"] and all(len(c) == 1 for c in chunks[:a.MAX_SOLO_MERGES])
+    assert [len(c) for c in chunks[a.MAX_SOLO_MERGES:]] == [a.MERGE_CHUNK, 20 - a.MAX_SOLO_MERGES - a.MERGE_CHUNK]
+    assert a.plan_chunks(items[6:]) == [items[6:]]                  # no retries: plain chunking
+
+
+def test_load_retry_falls_back_to_empty_on_a_wrong_shape():
+    """A list, null, or a non-integer count in merge_retry.json warns and reads as an empty ledger."""
+    with sandbox():
+        for bad in ("[]", "null", '{"pending": {"x": "1"}, "gave_up": []}', '{"pending": [], "gave_up": []}',
+                    '{"pending": {}, "gave_up": {"x": 1}}', '{"pending": {"x": true}}', "{oops"):
+            a.RETRY_PATH.write_text(bad)
+            with capture_logs() as lines:
+                assert a.load_retry() == {"pending": {}, "gave_up": []}, bad
+            assert any("merge_retry.json unreadable" in ln for ln in lines), bad
+        a.RETRY_PATH.write_text('{"pending": {"x": 1}, "gave_up": ["y"]}')
+        assert a.load_retry() == {"pending": {"x": 1}, "gave_up": ["y"]}
+
+
+def test_main_gives_up_on_an_item_that_fails_alone_every_run():
+    """When every chunk fails the failures are still recorded, so a lone poisoned item stops failing the job."""
+    now = datetime.now(timezone.utc)
+    names = ("SOURCES", "FETCHERS", "merge_checked", "load_env", "radar_scan", "enrich_thin",
+             "prune_to_cap", "commit", "lint_index")
+    saved = {n: getattr(a, n) for n in names}, sys.argv
+
+    def fetch(name, slug, url, since):
+        return [a.Item(name, slug, "POISON", "https://x/poison", now - timedelta(hours=1), "body " * 200)]
+
+    def reject(index_md, chunk, creds, hint="", retries=1):
+        raise a.MergeRejected("guard")
+    try:
+        a.SOURCES = [("blog", "bl", "stub", "https://x/feed")]
+        a.FETCHERS = {"stub": fetch}
+        a.merge_checked = reject
+        a.load_env = lambda: {}
+        a.radar_scan = lambda wiki, creds: a.RadarReport([], [], [])
+        a.enrich_thin = lambda items: None
+        a.prune_to_cap = lambda md, creds: md
+        a.commit = lambda *args: None
+        a.lint_index = lambda *args, **kw: None
+        sys.argv = ["ai_research.py"]
+        with sandbox(), capture_logs():
+            a.INDEX_PATH.write_text("## S\n\n- seed - s, 2026-01-01 [2025-01-01-zz-01]\n")
+            codes = [a.main() for _ in range(a.MAX_MERGE_FAILURES)]
+            assert codes == [1] * a.MAX_MERGE_FAILURES
+            assert len(a.load_retry()["gave_up"]) == 1
+            assert a.main() == 0
+    finally:
+        for n, v in saved[0].items():
+            setattr(a, n, v)
+        sys.argv = saved[1]
+
+
 def test_merge_chunked_merges_in_chunks_and_skips_a_failed_chunk():
     """Items go to the model MERGE_CHUNK at a time; a rejected chunk is skipped, the rest still land."""
     items = [item("ab", f"https://x/{n}") for n in range(a.MERGE_CHUNK * 2 + 3)]
@@ -1030,6 +1386,54 @@ def _prune_with(wiki: str, replies: list) -> str:
         return a.prune_to_cap(wiki, {"base_url": "x", "api_key": "y"})
     finally:
         openai.OpenAI = real
+
+
+def test_unwrap_claims_joins_continuations_but_not_code_or_sub_bullets():
+    """A wrapped claim becomes one line; fences, sub-bullets and headings are left alone."""
+    md = ("## S\n\n- Let agents write code against MCP servers,\n  which is code mode [2026-01-01-cf-01]\n"
+          "- Example:\n```python\nx = 1\n```\n  - a sub-bullet\n\n## T\n")
+    out = a.unwrap_claims(md)
+    assert "- Let agents write code against MCP servers, which is code mode [2026-01-01-cf-01]" in out
+    assert "```python\nx = 1\n```" in out and "  - a sub-bullet" in out and out.endswith("## T\n")
+    assert a.unwrap_claims(out) == out
+
+
+def test_unwrap_claims_keeps_other_blocks_and_joins_only_continuations():
+    """Lists, rules, setext underlines, HTML and fences stay put; "#1", "<5ms" and inline ``` lines join."""
+    cases = [  # (name, input, expected output)
+        ("numbered list", "- claim [x]\n1. first\n  2) second\n", None),
+        ("plus bullet", "- claim [x]\n  + nested plus\n", None),
+        ("horizontal rules", "- claim\n---\n- claim\n***\n- claim\n___\n- claim\n* * *\n- after\n", None),
+        ("setext underline", "- claim\n===\n", None),
+        ("html block", "- claim\n<details>\n", None),
+        ("tilde fence", "- Example:\n~~~\nx = 1\n- y\n  z\n~~~\n- a,\n  b [x]\n",
+         "- Example:\n~~~\nx = 1\n- y\n  z\n~~~\n- a, b [x]\n"),
+        ("fence closes only on same char and length", "- E:\n````\n```\n- y\n  z\n~~~\n````\n- a,\n  b [x]\n",
+         "- E:\n````\n```\n- y\n  z\n~~~\n````\n- a, b [x]\n"),
+        ("inline triple backticks", "- use the\n  ```--fast``` flag [x]\n- b,\n  wrapped [y]\n",
+         "- use the ```--fast``` flag [x]\n- b, wrapped [y]\n"),
+        ("less-than continuation", "- keep p99\n  <5ms [x]\n", "- keep p99 <5ms [x]\n"),
+        ("#1 continuation", "- ranked\n  #1 on SWE-bench [x]\n## H\n", "- ranked #1 on SWE-bench [x]\n## H\n"),
+        ("topic-file marker", "## T\n\n- stub\n<!-- topic-file: topics/t.md -->\n", None),
+        ("generated-file comment", "- claim\n<!-- Generated by ingest/ai_research.py. INDEX.md points here. -->\n", None),
+    ]
+    for name, md, want in cases:
+        out = a.unwrap_claims(md)
+        assert out == (md if want is None else want), (name, out)
+        assert a.unwrap_claims(out) == out, name
+
+
+def test_prune_deletes_a_wrapped_claim_whole_and_protects_its_second_line():
+    """A claim wrapped over two lines is deleted whole, and a watchlist term on its second line counts."""
+    with sandbox():
+        a.WATCHLIST_PATH.write_text("code mode\n")
+        filler = " ".join(["word"] * 60)
+        lines = [f"- {filler} number {n} [2026-01-01-ab-{n:02d}]" for n in range(40)]
+        lines[0] = f"- {filler} wrapped first,\n  second line [2026-01-01-ab-00]"
+        lines[1] = f"- {filler} also wrapped,\n  and this is code mode [2026-01-01-zz-01]"
+        out = _prune_with("## S\n\n" + "\n".join(lines) + "\n", [str(list(range(0, 20)))])
+        assert "second line" not in out and "2026-01-01-ab-00" not in out    # no orphaned tail
+        assert "code mode" in out                                           # sole carrier spared
 
 
 def test_prune_reply_naming_every_claim_stops_at_target_and_floor():
@@ -1315,6 +1719,94 @@ def test_hf_papers_keeps_papers_listed_today_but_published_earlier():
     assert [it.url for it in items] == ["https://huggingface.co/papers/2510.01234"]
     assert items[0].published == published                  # publishedAt is kept for attribution
     assert items[0].body == "abstract"
+
+
+def _radar_cands(*terms: str) -> list:
+    """Radar candidates with the given terms and placeholder evidence counts."""
+    return [radar.Candidate(term=t, key=t.replace(" ", ""), items=3, sources=2, in_titles=0, baseline=0)
+            for t in terms]
+
+
+def test_radar_picks_accept_numbers_in_a_fence():
+    """A fenced array of numbers picks those candidates in reply order; out-of-range numbers are ignored."""
+    cands = _radar_cands("codemode", "france", "tool search")
+    picked = a.parse_radar_picks("```json\n[2, 0, 9]\n```", cands)
+    assert [c.term for c in picked] == ["tool search", "codemode"]
+
+
+def test_radar_picks_accept_terms_but_only_listed_ones():
+    """A reply of terms (the 2026-10-23 failure) maps back to candidates; an unlisted term is dropped."""
+    cands = _radar_cands("embeddinggemma", "vllm", "france")
+    raw = '```json\n[\n    "embeddinggemma",\n    "VLLM",\n    "deepinfer",\n    "vllm"\n]\n```'
+    picked = a.parse_radar_picks(raw, cands)
+    assert [c.term for c in picked] == ["embeddinggemma", "vllm"]
+
+
+def test_radar_picks_none_without_an_array():
+    """A reply with no JSON array returns None so the caller logs a filter failure."""
+    assert a.parse_radar_picks("I cannot help with that.", _radar_cands("vllm")) is None
+    assert a.parse_radar_picks("[not json]", _radar_cands("vllm")) is None
+
+
+
+def test_radar_picks_skip_bracketed_prose_before_the_answer():
+    """Brackets in reasoning or prose before the answer do not hide the real array."""
+    cands = _radar_cands("codemode", "france", "tool search")
+    assert [c.term for c in a.parse_radar_picks("Candidates (see [notes]): [0, 2]", cands)] == \
+        ["codemode", "tool search"]
+    assert [c.term for c in a.parse_radar_picks("<think>maybe [codemode]?</think>\n[2]", cands)] == \
+        ["tool search"]
+
+
+def test_radar_picks_accept_python_style_and_quoted_number_replies():
+    """Single-quoted terms and numbers sent as strings still map to candidates."""
+    cands = _radar_cands("vllm", "codemode", "france")
+    assert [c.term for c in a.parse_radar_picks("['vllm', 'codemode']", cands)] == ["vllm", "codemode"]
+    assert [c.term for c in a.parse_radar_picks('["\'vllm\'"]', cands)] == ["vllm"]
+    assert [c.term for c in a.parse_radar_picks('["0", "1"]', cands)] == ["vllm", "codemode"]
+    assert a.parse_radar_picks("[]", cands) == []
+
+
+_RADAR_REPLY_CASES = [
+    # Trailing prose, an echo of the candidates, or a "rejected" list never overrides the answer.
+    ('```json\n[0, 2]\n```\nExcluded [1, 3]: place names.', ["codemode", "tool search"]),
+    ('{"picks": [0, 2], "rejected": [1, 3]}', ["codemode", "tool search"]),
+    ('{"keep": ["codemode", "tool search"], "reject": ["france", "paris"]}', ["codemode", "tool search"]),
+    ('[0, 2]\n\nConsidered: [0, 1, 2, 3]', ["codemode", "tool search"]),
+    # A year or empty note after a terms answer is not the answer.
+    ('["codemode", "tool search"] (news from [2026])', ["codemode", "tool search"]),
+    ('["codemode"]\nOthers: []', ["codemode"]),
+    # Thinking before the answer: out-of-range or unlisted guesses and <think> blocks are skipped.
+    ("maybe [9]? final: [0]", ["codemode"]),
+    ('maybe ["deepinfer"]? final: ["codemode"]', ["codemode"]),
+    ("<think>[1]? no.</think>[0]", ["codemode"]),
+    ("[1]? no.</think>\n[0]", ["codemode"]),
+    ('{"rejected": [1, 3]}', None),
+    ('Candidates: ["vllm"]. None qualify: []', []),
+    # Numbers are the format asked for: they beat quoted terms, and an echo of every term is
+    # no answer.
+    ('Of ["codemode", "france", "tool search"], the techniques are: [0, 2]', ["codemode", "tool search"]),
+    ('Candidates: ["codemode", "france", "tool search", "paris"]. None qualify: []', []),
+    ('[0, "tool search"]', ["codemode", "tool search"]),
+    # Known limit: a cited line number reads as a number answer and beats the terms answer.
+    ('Answer: ["codemode"] (per line [1])', ["france"]),
+]
+
+
+def test_radar_picks_read_the_answer_by_structure_not_position():
+    """The answer is the JSON reply (or its answer key), else the first array naming a candidate."""
+    cands = _radar_cands("codemode", "france", "tool search", "paris")
+    for raw, want in _RADAR_REPLY_CASES:
+        picked = a.parse_radar_picks(raw, cands)
+        got = None if picked is None else [c.term for c in picked]
+        assert got == want, raw
+
+
+def test_radar_picks_survive_odd_digits():
+    """A superscript digit or a huge number is skipped, not an exception that drops the filter."""
+    cands = _radar_cands("codemode", "france")
+    assert a.parse_radar_picks('["\u00b2"]', cands) == []
+    assert [c.term for c in a.parse_radar_picks("[" + "9" * 5000 + "] [0]", cands)] == ["codemode"]
 
 
 def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
