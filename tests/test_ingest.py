@@ -1316,6 +1316,15 @@ def test_one_hashtag_does_not_make_an_ordinary_phrase_a_coinage(monkeypatch):
     assert found.get("promptcaching") == "prompt caching"
 
 
+def test_a_camelcase_product_name_is_still_a_coinage(monkeypatch):
+    """'LangGraph' in 2 items from one source is reported, as the lowercase spelling is."""
+    monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS | {"graph", "release", "loves"})
+    window = [arch_item("2026-10-02-ls-01", "latent-space", "LangGraph 1.0", "ships"),
+              arch_item("2026-10-03-ls-01", "latent-space", "Roundup", "the model loves LangGraph"),
+              arch_item("2026-10-03-nw-01", "news", "Other", "nothing relevant here")]
+    assert "langgraph" in [c.key for c in radar.emerging_terms(window, [], "")]
+
+
 def test_the_baseline_is_searched_with_every_spaced_spelling(monkeypatch):
     """'openai agents' and 'open ai agents' are one term, whichever spelling the window shows first."""
     monkeypatch.setattr(radar, "_DICT_WORDS", RADAR_WORDS | {"open", "agent", "launch"})
