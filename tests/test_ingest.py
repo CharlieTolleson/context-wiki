@@ -16,6 +16,7 @@ The merge prompt's untrusted block neutralises delimiter variants and spoofed it
 The merge output guard rejects added HTML and id-less bullets; lint reports URLs and shell pipes.
 Small merge batches are quota-capped per source, and the HF papers fetcher selects by listing day.
 The radar filter's reply parser accepts candidate numbers or listed terms, fenced or not.
+HTML flattening stays linear on pages full of unclosed tags.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -2180,6 +2181,21 @@ def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
             assert bad_day in str(exc)
     finally:
         a.http_get = real
+
+
+def test_strip_html_is_linear_on_unclosed_tags():
+    """Pages full of unclosed "<" or "<script" flatten in well under a second, and ordinary
+    HTML flattens as before (the old patterns took 10 s on 200 KB of "<a")."""
+    import time
+    for raw in ("<a" * 1_000_000, "<script>" * 300_000, "<style" * 300_000):
+        start = time.monotonic()
+        a.strip_html(raw)
+        assert time.monotonic() - start < 2, raw[:10]
+    assert a.strip_html("<p>Hi <b>there</b></p><script>var a='<b>';</script>tail") == "Hi there \n tail"
+    assert a.strip_html("<SCRIPT type=x>hidden</SCRIPT >shown") == "shown"
+    assert a.strip_html("x<scripts>y</scripts>z") == "x y z"          # not a script element
+    assert a.strip_html("intro<script>never closed") == "intro"     # runs to the end, as a browser reads it
+    assert a.strip_html("<p>1 < 2 &amp; 3</p>") == "1 < 2 & 3"
 
 
 if __name__ == "__main__":

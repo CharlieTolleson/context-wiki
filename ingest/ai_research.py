@@ -313,12 +313,19 @@ def load_env() -> dict[str, str]:
 
 
 def strip_html(raw: str) -> str:
-    """Flatten HTML to readable text. Feed bodies are HTML fragments."""
+    """Flatten HTML to readable text. Feed bodies are HTML fragments.
+
+    Every pattern stops at the next "<" or at the end of the text, so one scan is linear.
+    The earlier `<[^>]+>` and `<script[^>]*>.*?</script>` rescanned to the end from every
+    unclosed "<" or "<script", which made a page of them quadratic: 200 KB took 10 s, and
+    enrich_thin and --add-url accept pages up to MAX_FETCH_BYTES (audit 2026-10-28). An
+    unclosed script or style element runs to the end of the text, as a browser reads it.
+    """
     if not raw:
         return ""
-    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", raw)
+    text = re.sub(r"(?is)<(script|style)\b.*?(?:</\1\s*>|\Z)", " ", raw)
     text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = re.sub(r"<[^<>]*>", " ", text)
     text = html.unescape(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
