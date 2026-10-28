@@ -1933,6 +1933,20 @@ def test_lint_checks_ids_against_the_archive_not_the_wiki_just_written():
         assert not any(real.item_id in p for p in problems)
 
 
+def test_lint_reads_star_bullets_like_dash_bullets():
+    """A "* " claim is a claim to count_claims and prune, so lint checks it too."""
+    with sandbox():
+        real = a.Item("src", "sw", "t", "https://x/real", datetime(2026, 10, 1, tzinfo=timezone.utc), "body")
+        a.write_archive([real], "2026-10-01")
+        md = ("## S\n\n* one - src, 2026-10-01 [2099-01-01-zz-99]\n"
+              "* two - src, 2026-10-01 [2099-01-01-zz-99]\n"
+              "* Implement Recuris for agents - src, 2026-10-01 [" + real.item_id + "]\n")
+        problems = lint_lines(md, set(), a.archive_facts())
+        assert any("2099-01-01-zz-99" in p and ">1 bullet" in p for p in problems), problems
+        assert any("2099-01-01-zz-99" in p and "fabricated" in p for p in problems), problems
+        assert any("Recuris" in p for p in problems), problems
+
+
 def test_lint_flags_a_changed_citation_date_and_a_bodiless_source():
     """A single-id claim must carry the archived date; a claim on a record with no body is reported."""
     with sandbox():
