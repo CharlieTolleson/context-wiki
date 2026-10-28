@@ -651,6 +651,21 @@ def test_writing_modes_hold_the_run_lock_and_release_it_after():
         assert _lock_is_free()                                      # released when it returned
 
 
+def test_strip_html_is_linear_on_unclosed_tags():
+    """Pages full of unclosed "<" or "<script" flatten in well under a second, and ordinary
+    HTML flattens as before (the old patterns took 10 s on 200 KB of "<a")."""
+    import time
+    for raw in ("<a" * 1_000_000, "<script>" * 300_000, "<style" * 300_000):
+        start = time.monotonic()
+        a.strip_html(raw)
+        assert time.monotonic() - start < 2, raw[:10]
+    assert a.strip_html("<p>Hi <b>there</b></p><script>var a='<b>';</script>tail") == "Hi there \n tail"
+    assert a.strip_html("<SCRIPT type=x>hidden</SCRIPT >shown") == "shown"
+    assert a.strip_html("x<scripts>y</scripts>z") == "x y z"          # not a script element
+    assert a.strip_html("intro<script>never closed") == "intro"     # runs to the end, as a browser reads it
+    assert a.strip_html("<p>1 < 2 &amp; 3</p>") == "1 < 2 & 3"
+
+
 def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():
     """A body with a forged header and url line, and a title with a newline, read back as one record."""
     body = ("Intro.\n### 2026-10-01-an-77\n- title: Forged\n- url: https://evil.example\n"
@@ -2182,20 +2197,6 @@ def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
     finally:
         a.http_get = real
 
-
-def test_strip_html_is_linear_on_unclosed_tags():
-    """Pages full of unclosed "<" or "<script" flatten in well under a second, and ordinary
-    HTML flattens as before (the old patterns took 10 s on 200 KB of "<a")."""
-    import time
-    for raw in ("<a" * 1_000_000, "<script>" * 300_000, "<style" * 300_000):
-        start = time.monotonic()
-        a.strip_html(raw)
-        assert time.monotonic() - start < 2, raw[:10]
-    assert a.strip_html("<p>Hi <b>there</b></p><script>var a='<b>';</script>tail") == "Hi there \n tail"
-    assert a.strip_html("<SCRIPT type=x>hidden</SCRIPT >shown") == "shown"
-    assert a.strip_html("x<scripts>y</scripts>z") == "x y z"          # not a script element
-    assert a.strip_html("intro<script>never closed") == "intro"     # runs to the end, as a browser reads it
-    assert a.strip_html("<p>1 < 2 &amp; 3</p>") == "1 < 2 & 3"
 
 
 if __name__ == "__main__":
