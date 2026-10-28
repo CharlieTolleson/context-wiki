@@ -664,6 +664,24 @@ def test_strip_html_is_linear_on_unclosed_tags():
     assert a.strip_html("x<scripts>y</scripts>z") == "x y z"          # not a script element
     assert a.strip_html("intro<script>never closed") == "intro"     # runs to the end, as a browser reads it
     assert a.strip_html("<p>1 < 2 &amp; 3</p>") == "1 < 2 & 3"
+    # Not script elements: a custom element and a self-closed tag leave the page after them.
+    assert a.strip_html("<script-loader src=x></script-loader><p>Body</p>") == "Body"
+    assert a.strip_html('<p>Intro.</p><script src="t.js"/><p>Body text.</p>') == "Intro.\n Body text."
+    assert a.strip_html("a<!-- if a < b -->b") == "a b"                 # a "<" in a comment
+
+
+def test_title_lookup_is_linear_on_unclosed_tags():
+    """The h1 and title lookups take the first element, and a page of unclosed openers is fast."""
+    import time
+    for raw in ("<h1>" * 50_000, "<title>" * 30_000, "<h1 " * 50_000):
+        start = time.monotonic()
+        assert a.first_element(raw, raw[1:3] if raw[1] == "h" else "title", ignore_case=True) is None
+        assert time.monotonic() - start < 2, raw[:8]
+    page = "<head><title>T</title></head><H1 class=x>One</H1><h1>Two</h1>"
+    assert a.first_element(page, "h1") == "Two"                         # case-sensitive by default
+    assert a.first_element(page, "h1", ignore_case=True) == "One"
+    assert a.first_element(page, "title") == "T"
+    assert a.first_element("<h1x>no</h1x><h1>yes</h1>", "h1") == "yes"
 
 
 def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():

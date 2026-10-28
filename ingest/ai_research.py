@@ -319,17 +319,36 @@ def strip_html(raw: str) -> str:
     The earlier `<[^>]+>` and `<script[^>]*>.*?</script>` rescanned to the end from every
     unclosed "<" or "<script", which made a page of them quadratic: 200 KB took 10 s, and
     enrich_thin and --add-url accept pages up to MAX_FETCH_BYTES (audit 2026-10-28). An
-    unclosed script or style element runs to the end of the text, as a browser reads it.
+    unclosed script or style element, or comment, runs to the end of the text, as a browser
+    reads it. Only a complete opener counts: "<script-loader>" and a self-closed
+    "<script src=x/>" are ordinary tags, so they cannot swallow the page after them.
     """
     if not raw:
         return ""
-    text = re.sub(r"(?is)<(script|style)\b.*?(?:</\1\s*>|\Z)", " ", raw)
+    text = re.sub(r"(?s)<!--.*?(?:-->|\Z)", " ", raw)
+    text = re.sub(r"(?is)<(script|style)(?=[\s/>])[^<>]*(?<!/)>.*?(?:</\1\s*>|\Z)", " ", text)
     text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</li>", "\n", text)
     text = re.sub(r"<[^<>]*>", " ", text)
     text = html.unescape(text)
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
     return text.strip()
+
+
+def first_element(page: str, tag: str, ignore_case: bool = False) -> str | None:
+    """Inner HTML of the first <tag ...>...</tag>, or None. Linear in the page.
+
+    re.search(r"<h1[^>]*>(.*?)</h1>") retried the lazy scan to the end from every opener, so
+    a page of unclosed "<h1>" took 60 s for 200 KB. The first opener's closing tag is found
+    with one str.find; if it has none, no later opener has one either.
+    """
+    flags = re.I if ignore_case else 0
+    opener = re.search(rf"<{tag}(?=[\s/>])[^<>]*>", page, flags)
+    if not opener:
+        return None
+    hay = page.lower() if ignore_case else page
+    end = hay.find(f"</{tag}>", opener.end())
+    return None if end < 0 else page[opener.end():end]
 
 
 # Upper bound on one HTTP response body. The largest real input is a full Atom
@@ -958,9 +977,9 @@ def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[It
             if m:
                 pub = parse_date(f"{m.group(1)} {m.group(2)} {m.group(3)}")
         title = path.rsplit("/", 1)[-1].replace("-", " ").title()
-        h1 = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.S)
-        if h1:
-            title = strip_html(h1.group(1)) or title
+        h1 = first_element(page, "h1")
+        if h1 is not None:
+            title = strip_html(h1) or title
         items.append(Item(name, slug, title, full,
                           pub or datetime.now(timezone.utc), prose[:MAX_BODY_CHARS]))
     return items
@@ -3034,10 +3053,10 @@ def fetch_one_url(url: str, source: str | None) -> Item:
         prose = strip_html(page)[:MAX_BODY_CHARS]
 
     title = ""
-    for pat in (r"<h1[^>]*>(.*?)</h1>", r"<title[^>]*>(.*?)</title>"):
-        m = re.search(pat, page, re.S | re.I)
-        if m:
-            title = strip_html(m.group(1)).strip()
+    for tag in ("h1", "title"):
+        inner = first_element(page, tag, ignore_case=True)
+        if inner is not None:
+            title = strip_html(inner).strip()
             if title:
                 break
     host = urllib.parse.urlparse(url).netloc.replace("www.", "")
