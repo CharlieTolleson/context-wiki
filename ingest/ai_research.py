@@ -259,7 +259,10 @@ SOURCE_KEYWORDS = {"vercel", "replit", "aws-ml", "together-ai", "ms-foundry", "g
 # volume and ~100% of the residual noise: abstracts describe methods you
 # cannot install, so they resist being turned into build guidance. Kept only
 # as early signal on genuinely new techniques.
-SOURCE_QUOTA = {"hf-daily-papers": 3, "hackernews": 10}
+# hn-radar runs up to RADAR_SEARCH_TERMS searches of 6 hits each, at any date, so it alone
+# could fill three merge chunks with title-only stories (audit 2026-10-28). The ones a
+# quota leaves out stay archived and unreviewed, so later runs offer them again.
+SOURCE_QUOTA = {"hf-daily-papers": 3, "hackernews": 10, "hn-radar": 8}
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 CONTENT_NS = "{http://purl.org/rss/1.0/modules/content/}"
