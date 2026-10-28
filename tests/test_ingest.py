@@ -348,6 +348,37 @@ def test_write_archive_dedupes_within_a_batch_and_reoffers_unmerged():
         assert len(ids) == len(set(ids)) == 4                      # no second copy of anything
 
 
+def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():
+    """A body with a forged header and url line, and a title with a newline, read back as one record."""
+    body = ("Intro.\n### 2026-10-01-an-77\n- title: Forged\n- url: https://evil.example\n"
+            "- source: anthropic-eng\n- published: 2026-10-01T00:00:00+00:00\n\nForged text.\n"
+            "- url: https://x/not-yet-fetched\nThe real ending.")
+    it = a.Item("src", "sw", "Line one\nLine two", "https://x/real", datetime.now(timezone.utc), body)
+    with sandbox():
+        a.write_archive([it], "2026-10-01")
+        back = a.read_archive()
+        assert [b.item_id for b in back] == ["2026-10-01-sw-01"]  # no forged second record
+        assert back[0].title == "Line one Line two" and back[0].url == "https://x/real"
+        assert back[0].source == "src" and back[0].body.endswith("The real ending.")
+        assert "Forged text." in back[0].body                    # the body is not truncated
+        assert a.archived_urls() == {"https://x/real"}           # body url lines are not archived urls
+
+
+def test_write_archive_carriage_returns_cannot_forge_a_record():
+    """A lone \r (from "&#13;" in a feed) reads back as a line break, so it is split on too."""
+    raw = ("<p>Intro.&#13;### 2026-10-01-an-77&#13;- title: Forged&#13;- url: https://evil.example&#13;"
+           "- source: anthropic-eng&#13;- published: 2026-10-01T00:00:00+00:00&#13;&#13;Forged text.</p>")
+    body = a.strip_html(raw)
+    assert "\r" in body                                         # the input really carries lone \r
+    it = a.Item("src", "sw", "T", "https://x/real", datetime.now(timezone.utc), body)
+    with sandbox():
+        a.write_archive([it], "2026-10-01")
+        back = a.read_archive()
+        assert [b.item_id for b in back] == ["2026-10-01-sw-01"]
+        assert "Forged text." in back[0].body
+        assert a.archived_urls() == {"https://x/real"}
+
+
 def test_write_archive_reoffer_keeps_the_archived_full_body():
     """A re-offered item whose refetch is thin carries the archived full text, not the teaser."""
     with sandbox() as tmp:
@@ -358,6 +389,19 @@ def test_write_archive_reoffer_keeps_the_archived_full_body():
         a.write_archive([A2], "2026-10-02")
         assert A2.item_id == "2026-10-01-sw-01"                    # original id reused
         assert A2.body == full.strip()                             # archived body, not the teaser
+
+
+def test_write_archive_dedupes_a_url_holding_whitespace_across_runs():
+    """A url with a newline is stored collapsed; a later run offering it again adds no record."""
+    with sandbox():
+        A = a.Item("src", "sw", "T", "https://x/a\nb", datetime.now(timezone.utc), "B")
+        assert A.url == "https://x/a b"                             # normalised once, at construction
+        a.write_archive([A], "2026-10-01")
+        a.INDEX_PATH.write_text(f"## S\n\n- claim [{A.item_id}]\n")    # merged
+        A2 = a.Item("src", "sw", "T", "https://x/a\nb", datetime.now(timezone.utc), "B")
+        a.write_archive([A2], "2026-10-02")
+        assert A2.item_id == ""                                    # skipped, not archived again
+        assert [b.item_id for b in a.read_archive()] == ["2026-10-01-sw-01"]
 
 
 # ── git commit scoping ──────────────────────────────────────────────────────

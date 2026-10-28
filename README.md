@@ -30,7 +30,7 @@ Design decisions worth knowing:
 - **Merge, never append.** Each run rewrites the whole wiki from the current wiki plus new items, so overlapping findings are merged into one claim that cites every source, and superseded claims are replaced. A word cap forces the model to decide what earns its place.
 - **A build manual, not a digest.** The merge prompt only admits a claim if an engineer could act on it while writing code. Funding news, launches, benchmarks-as-marketing, and paper abstracts with no reproducible technique are rejected.
 - **Content-based pruning.** Nothing expires on a timer. A claim leaves only when it is superseded, absorbed into another claim, or no longer decision-relevant.
-- **Greppable ids.** Every claim ends with an attribution (source, date, and item ids in brackets). `grep -rn "<item-id>" archive/` returns the stored article and its URL, so follow-up questions need no network call.
+- **Greppable ids.** Every claim ends with an attribution (source, date, and item ids in brackets). `grep -rn "^### <item-id>$" archive/` returns the stored article and its URL, so follow-up questions need no network call.
 - **Shrink guard.** A merge that keeps under 75% of the existing claims is retried once with the dropped claims listed, then rejected, leaving the wiki untouched. A model can ignore "the word cap is a ceiling, not a target"; code cannot.
 - **Watchlist guard.** `watchlist.txt` lists concepts that must be covered (one per line, aliases separated by `|`). Once the wiki mentions a concept, a merge that removes every mention is retried and then rejected, so a technique cannot be pruned away by accident.
 - **Chunked merging.** Items go to the model 15 at a time, each chunk merging into the result of the last. One 60-item prompt made the model either rewrite the wiki wholesale (tripping the guards) or ignore the new items. A chunk the guards reject is skipped, and the sources of its items keep their old watermark so the next run refetches them (the Anthropic corpus, which has no watermark, refetches any archived article no merge has seen yet), ranks them ahead of new items for their source's quota, and merges up to four of them alone, one per call, before the usual chunks. The guards reject a whole chunk, so only a guard refusal of an item merged alone counts against it (a connection error or timeout does not): one refused alone twice is given up on (`ingest/merge_retry.json`) and left to `--backfill`, so one poisoned item cannot sink a chunk every day and its chunk-mates are not given up with it.
@@ -180,7 +180,7 @@ for web search on those topics.
 
 A large section lives in `topics/<topic>.md`; INDEX.md then shows a one-line pointer for it.
 Open that file when the topic fits your task. Each claim ends with a source, a date, and
-item ids in brackets. For more detail, `grep -rn "<item-id>" <WIKI_ARCHIVE_DIR>`
+item ids in brackets. For more detail, `grep -rn "^### <item-id>$" <WIKI_ARCHIVE_DIR>`
 returns the stored article and its URL. Fetch the URL only if the stored body is thin.
 ```
 
