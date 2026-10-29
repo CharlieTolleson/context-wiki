@@ -118,7 +118,7 @@ Constants at the top of `ingest/ai_research.py`:
 |---|---|---|
 | `SOURCES` | 23 sources | Add a tuple `(name, two-letter-id, kind, url)`. Kinds: `feed` (RSS or Atom), `hn`, `hf_papers` (new by listing day, since a day's list carries papers published weeks earlier), `html_index`. The id must be exactly two lowercase letters |
 | `SOURCE_KEYWORDS` | 9 sources | General engineering blogs whose items are kept only when the title or opening matches `RELEVANCE_RE` |
-| `SOURCE_QUOTA` | papers 3, HN 10 | Max items a high-volume source may put in one merge batch, however small the batch. The rest stay archived |
+| `SOURCE_QUOTA` | papers 3, HN 10, HN radar 8 | Max items a high-volume source may put in one merge batch, however small the batch. The rest stay archived. HN radar keeps search order, so watchlist hits come first |
 | `WORD_CAP` | `2000` | Hard cap on the whole wiki. The merge prompt, lint, and shrink guard all follow it |
 | `LOOKBACK_CAP_DAYS` | `14` | Longest backfill after an outage |
 | `TOPIC_META` | 7 sections | Section titles, file slugs, and one-line scopes. Sections the model invents are handled too |

@@ -259,7 +259,12 @@ SOURCE_KEYWORDS = {"vercel", "replit", "aws-ml", "together-ai", "ms-foundry", "g
 # volume and ~100% of the residual noise: abstracts describe methods you
 # cannot install, so they resist being turned into build guidance. Kept only
 # as early signal on genuinely new techniques.
-SOURCE_QUOTA = {"hf-daily-papers": 3, "hackernews": 10}
+# hn-radar runs up to RADAR_SEARCH_TERMS searches of 6 hits each, at any date, so it alone
+# could fill three merge chunks with title-only stories (audit 2026-10-28). Its bucket keeps
+# search order, so watchlist hits come first. The ones the quota leaves out stay archived and
+# unreviewed: a later run offers them again only if it searches the same term and HN still
+# returns them, and otherwise --backfill reaches them.
+SOURCE_QUOTA = {"hf-daily-papers": 3, "hackernews": 10, "hn-radar": 8}
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 CONTENT_NS = "{http://purl.org/rss/1.0/modules/content/}"
@@ -1855,6 +1860,12 @@ def select_for_merge(items: list[Item]) -> list[Item]:
     buckets: dict[str, list[Item]] = {}
     for it in sorted(items, key=lambda i: (i.retry, i.published), reverse=True):
         buckets.setdefault(it.source, []).append(it)
+    # hn-radar ranks by search order, not date: radar_scan puts missing watchlist concepts
+    # first, and their originating posts are old by design, so newest first let recent
+    # emerging-term hits take every slot and a missing concept never reached a merge.
+    if "hn-radar" in buckets:
+        order = {id(it): n for n, it in enumerate(items)}
+        buckets["hn-radar"].sort(key=lambda i: (not i.retry, order[id(i)]))
     # Apply per-source quotas before round-robin so a high-volume source cannot
     # dominate the batch even when other sources are quiet.
     for src, cap in SOURCE_QUOTA.items():

@@ -2251,6 +2251,30 @@ def test_radar_picks_survive_odd_digits():
     assert [c.term for c in a.parse_radar_picks("[" + "9" * 5000 + "] [0]", cands)] == ["codemode"]
 
 
+def test_radar_hits_are_quota_capped_in_a_small_batch():
+    """A radar search can return dozens of title-only stories; only SOURCE_QUOTA of them merge."""
+    now = datetime.now(timezone.utc)
+    radar_items = [a.Item("hn-radar", "hr", f"Story {n}", f"https://x/r{n}", now - timedelta(days=n), "(10 points)")
+                   for n in range(30)]
+    blog = [a.Item("blog", "bl", f"Post {n}", f"https://x/b{n}", now, "body " * 50) for n in range(5)]
+    picked = a.select_for_merge(radar_items + blog)
+    assert sum(i.source == "hn-radar" for i in picked) == a.SOURCE_QUOTA["hn-radar"] < 30
+    assert sum(i.source == "blog" for i in picked) == 5
+
+
+def test_radar_quota_keeps_watchlist_hits_that_were_searched_first():
+    """Year-old hits for a missing watchlist concept are searched first and must beat newer emerging-term hits."""
+    now = datetime.now(timezone.utc)
+    watch = [a.Item("hn-radar", "hr", f"Code Mode {n}", f"https://x/cm{n}", now - timedelta(days=365 + n), "(300 points)")
+             for n in range(6)]
+    emerging = [a.Item("hn-radar", "hr", f"Term {n}", f"https://x/t{n}", now - timedelta(days=2), "(80 points)")
+                for n in range(12)]
+    picked = a.select_for_merge(watch + emerging)
+    assert sum(i.title.startswith("Code Mode") for i in picked) == 6
+    retried = a.Item("hn-radar", "hr", "Retry", "https://x/retry", now - timedelta(days=900), "(1 points)", retry=True)
+    assert retried in a.select_for_merge(watch + emerging + [retried])
+
+
 def test_a_failed_hf_papers_day_fails_the_source_so_the_watermark_holds():
     """One listing day that errors raises naming that day (main() then holds the watermark)."""
     import urllib.error
