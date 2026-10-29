@@ -787,6 +787,20 @@ def test_only_the_oversized_section_moves_to_a_topic_file():
         assert "2026-01-01-ab-09" in (tmp / "topics" / "agent-architecture.md").read_text()
 
 
+def test_write_wiki_deletes_only_topic_files_it_wrote():
+    """A stale generated topic file is removed; the user's own notes in topics/ are not."""
+    with sandbox() as tmp, split_at(60):
+        (tmp / "topics").mkdir()
+        mine = tmp / "topics" / "my-own-note.md"
+        mine.write_text("# My note\n\nNot generated.\n")
+        a.write_wiki(two_sections())                                   # big section split out
+        assert (tmp / "topics" / "agent-architecture.md").exists() and mine.exists()
+        a.write_wiki(two_sections(big_claims=1))                       # shrinks back inline
+        assert not (tmp / "topics" / "agent-architecture.md").exists()  # generated: removed
+        assert mine.read_text() == "# My note\n\nNot generated.\n"      # user's: untouched
+        assert (tmp / "topics").is_dir()
+
+
 def test_assembled_wiki_is_identical_to_what_was_written():
     """read_wiki() must give back every claim, so the merge never notices where sections live."""
     with sandbox(), split_at(60):
