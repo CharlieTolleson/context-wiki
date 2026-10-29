@@ -682,6 +682,8 @@ def test_title_lookup_is_linear_on_unclosed_tags():
     assert a.first_element(page, "h1", ignore_case=True) == "One"
     assert a.first_element(page, "title") == "T"
     assert a.first_element("<h1x>no</h1x><h1>yes</h1>", "h1") == "yes"
+    # "İ".lower() is two characters; the slice must still end at the closing tag.
+    assert a.first_element("<title>İstanbul</title>", "title", ignore_case=True) == "İstanbul"
 
 
 def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():

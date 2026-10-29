@@ -340,15 +340,16 @@ def first_element(page: str, tag: str, ignore_case: bool = False) -> str | None:
 
     re.search(r"<h1[^>]*>(.*?)</h1>") retried the lazy scan to the end from every opener, so
     a page of unclosed "<h1>" took 60 s for 200 KB. The first opener's closing tag is found
-    with one str.find; if it has none, no later opener has one either.
+    with one literal search; if it has none, no later opener has one either. The closing tag
+    is searched in the page itself, not in page.lower(): lowercasing can change the string's
+    length ("İ" becomes two characters), which would shift the slice.
     """
     flags = re.I if ignore_case else 0
     opener = re.search(rf"<{tag}(?=[\s/>])[^<>]*>", page, flags)
     if not opener:
         return None
-    hay = page.lower() if ignore_case else page
-    end = hay.find(f"</{tag}>", opener.end())
-    return None if end < 0 else page[opener.end():end]
+    close = re.compile(rf"</{tag}>", flags).search(page, opener.end())
+    return None if close is None else page[opener.end():close.start()]
 
 
 # Upper bound on one HTTP response body. The largest real input is a full Atom
