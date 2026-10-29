@@ -2888,7 +2888,8 @@ def lint_index(md: str, known_ids: set[str],
     if words > WORD_CAP * 1.1:
         problems.append(f"{words} words, {words - WORD_CAP} over the {WORD_CAP} cap")
 
-    bullets = [ln for ln in md.splitlines() if ln.lstrip().startswith("- ")]
+    # The same bullets count_claims and prune treat as claims: Gemini often writes "* ".
+    bullets = [ln for ln in md.splitlines() if ln.lstrip().startswith(("- ", "* "))]
     seen: dict[str, int] = {}
     for b in bullets:
         for cid in set(ID_RE.findall(b)):
@@ -2938,7 +2939,7 @@ def lint_index(md: str, known_ids: set[str],
     # ("Implement JIT-Agent...", "Adopt Recuris..."). The subject is a research
     # artifact nobody can install, so the claim is not actionable.
     artifact = re.compile(
-        r"^-\s+(?:Use|Implement|Adopt|Utilize|Leverage|Introduce|Employ|Apply)\s+"
+        r"^[-*]\s+(?:Use|Implement|Adopt|Utilize|Leverage|Introduce|Employ|Apply)\s+"
         r"(?:the\s+|a\s+)?([A-Z][A-Za-z0-9]*(?:[- ][A-Z][A-Za-z0-9]*)*)\b"
     )
     named: list[str] = []
