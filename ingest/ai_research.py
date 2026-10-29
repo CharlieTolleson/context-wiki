@@ -1531,6 +1531,8 @@ def radar_scan(wiki_text: str, creds: dict[str, str] | None) -> RadarReport:
     if creds is not None:
         try:
             window, baseline = split_archive(read_archive())
+            if not radar.has_dictionary():
+                log("NOTE radar: no system word list, so single words need phrase evidence (no coinage lane)")
             cands = radar.emerging_terms(window, baseline, wiki_text)
             emerging = filter_candidates(cands, window, creds)
         except Exception as exc:

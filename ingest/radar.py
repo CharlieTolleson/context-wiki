@@ -16,9 +16,12 @@ has no paths, network, or LLM dependency. ai_research.py owns the I/O: it feeds 
 items in, runs targeted searches for what comes out, and passes a hint to the merge.
 
 Key design decisions:
-  * No dictionary or NLP library. "New" is defined against the archive itself: a term that
-    the older archive barely contains but the last few weeks contain often is new to us,
-    whatever it is. Common English words fail the baseline test automatically.
+  * No NLP library. "New" is defined against the archive itself: a term that the older
+    archive barely contains but the last few weeks contain often is new to us, whatever it
+    is. The one outside resource is the system word list (/usr/share/dict), used to tell a
+    coined single word ("codemode") from an ordinary one ("announcing"). Coinages need less
+    evidence than phrases; without the word list there is no coinage lane, and single words
+    must meet the phrase rules (more items, two sources).
   * Keys ignore case, spaces, and hyphens, so "code mode", "Code-Mode", and "codemode"
     are one term.
   * Candidates are ranked by how many distinct SOURCES carry them, not raw count, because
@@ -55,14 +58,16 @@ MIN_KEY_LEN = 6
 # A single token that is not an English word is a coinage or a name ("codemode", "langgraph"),
 # which is far more informative than a common phrase, so it needs less evidence.
 MIN_COINED_ITEMS = 2
-MIN_PHRASE_SOURCES = 2   # ordinary phrases need two independent sources; coinages do not
+MIN_PHRASE_SOURCES = 2   # ordinary phrases need two independent sources; coinages do not (with a word list)
 # Words that come from our own item templates and scraped social posts, never from the
 # subject matter. Any candidate containing one is noise.
 BOILERPLATE = frozenset("""points comments matched topic discussion subreddits twitters retweet
 impression count expanded reply replied url ainews http https www com""".split())
 # A concept can be a trend inside ONE source for weeks before a second one picks it up
 # (Latent Space was alone in mentioning "codemode" for a week), so a second source is not
-# required. Precision comes from the baseline test plus the LLM filter in ai_research.
+# required for a coinage. That lane needs a word list (/usr/share/dict/words, present on
+# macOS; on Linux install wamerican): without one, single words get phrase rules.
+# Precision comes from the baseline test plus the LLM filter in ai_research.
 
 
 class ItemLike(Protocol):
@@ -93,7 +98,7 @@ def _dictionary() -> set[str]:
     """Lowercase English words from the system word list, or an empty set if there is none.
 
     Used only to reject a single ordinary word ("announcing") posing as a coined term. It is
-    optional: without the file, single words are filtered by the baseline test and the LLM.
+    optional: without the file, has_dictionary() is False and the coinage lane is off.
     """
     global _DICT_WORDS
     if _DICT_WORDS is None:
@@ -106,6 +111,11 @@ def _dictionary() -> set[str]:
             except OSError:
                 continue
     return _DICT_WORDS
+
+
+def has_dictionary() -> bool:
+    """True if a system word list was found, so coinages can be told from ordinary words."""
+    return bool(_dictionary())
 
 
 def is_word(w: str) -> bool:
@@ -126,12 +136,12 @@ def collapse(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
-def _ngrams(text: str) -> dict[str, str]:
-    """Candidate phrases in `text` as {key: display}. One to three tokens, no edge stopwords."""
+def _ngrams(text: str) -> dict[str, set[str]]:
+    """Candidate phrases in `text` as {key: every spelling seen}. One to three tokens, no edge stopwords."""
     text = CONTRACTION_RE.sub("", text)   # "doesn't" -> "doesn", not a fragment candidate
     toks = TOKEN_RE.findall(text)
     low = [t.lower() for t in toks]
-    out: dict[str, str] = {}
+    out: dict[str, set[str]] = {}
     n = len(toks)
     for i in range(n):
         for size in (1, 2, 3):
@@ -146,7 +156,8 @@ def _ngrams(text: str) -> dict[str, str]:
                 continue
             if size == 1 and (len(words[0]) < 5 or is_word(words[0])):
                 continue
-            out.setdefault(key, " ".join(words).replace("-", " "))
+            shown = " ".join(words).replace("-", " ")
+            out.setdefault(key, set()).add(shown)   # every spelling, so neither order wins
     return out
 
 
@@ -172,24 +183,54 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     if len(window) < MIN_WINDOW_ITEMS:
         return []
 
-    per_item: list[tuple[ItemLike, dict[str, str], set[str]]] = []
+    per_item: list[tuple[ItemLike, dict[str, set[str]], set[str]]] = []
     seen_items: dict[str, set[int]] = {}
     seen_sources: dict[str, set[str]] = {}
     seen_days: dict[str, set[str]] = {}
-    display: dict[str, str] = {}
+    one_token_items: dict[str, set[int]] = {}   # items that write the key as one token ("codemode")
+    spaced_items: dict[str, set[int]] = {}      # items that write it as words ("code mode")
+    spaced: dict[str, set[str]] = {}            # every multi-word spelling ("open ai agents", "openai agents")
+    one_token: dict[str, set[str]] = {}         # every one-token spelling
+    camel_items: dict[str, set[int]] = {}
     for idx, it in enumerate(window):
+        # Hashtags only: a CamelCase product name ("LangGraph") is still a coinage.
+        for tok in re.findall(r"#[A-Za-z][A-Za-z0-9]*", _doc_text(it)):
+            camel_items.setdefault(collapse(tok), set()).add(idx)
         grams = _ngrams(_doc_text(it))
         title_keys = set(_ngrams(it.title))
         per_item.append((it, grams, title_keys))
-        for key, shown in grams.items():
+        for key, forms in grams.items():
             seen_items.setdefault(key, set()).add(idx)
             seen_sources.setdefault(key, set()).add(it.source)
             seen_days.setdefault(key, set()).add(it.item_id[:10])
-            display.setdefault(key, shown)
+            for shown in forms:
+                if " " in shown:
+                    spaced.setdefault(key, set()).add(shown)
+                    spaced_items.setdefault(key, set()).add(idx)
+                else:
+                    one_token.setdefault(key, set()).add(shown)
+                    one_token_items.setdefault(key, set()).add(idx)
+
+    # Without a word list every long ordinary word would look coined, so the lane is off.
+    use_coined = has_dictionary()
 
     def coined(key: str) -> bool:
-        """A one-token candidate that no dictionary knows."""
-        return " " not in display[key] and not is_word(key)
+        """A key written as one token in enough items on its own, that no dictionary knows.
+
+        Counting only the one-token items, not every item with the key, keeps a single
+        "#PromptCaching" from moving the ordinary phrase "prompt caching" into the lane.
+        """
+        ones = one_token_items.get(key, set())
+        # A one-token spelling ("codemode", "LangGraph") is a deliberate coinage; a hashtag
+        # ("#PromptCaching") is a phrase written for a tag, so it alone does not count.
+        return (use_coined and bool(ones - camel_items.get(key, set()))
+                and len(seen_items[key]) >= MIN_COINED_ITEMS and not is_word(key))
+
+    def display(key: str) -> str:
+        """The spelling most items use: the spaced form wins only as a strict majority."""
+        if len(spaced_items.get(key, ())) > len(one_token_items.get(key, ())):
+            return min(spaced[key])
+        return min(one_token[key])
 
     survivors = {k for k, ix in seen_items.items()
                  if len(seen_days[k]) >= MIN_WINDOW_DAYS
@@ -202,12 +243,20 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
     # cheaply no matter how many distinct phrases the window contains.
     # Word-boundary regexes, not collapsed substrings: "code mode" must not match
     # "decode mode", which a collapsed-text search does.
-    pats = {k: alias_pattern(display[k]) for k in survivors}
+    # Built from every spaced spelling seen: alias_pattern("code mode") also matches
+    # "codemode" and "code-mode", but alias_pattern("codemode") matches neither spaced form,
+    # and alias_pattern("openai agents") misses "open ai agents", so any one spelling alone
+    # can make an established term read as brand new.
+    pats = {k: re.compile("|".join(alias_pattern(f).pattern for f in sorted(spaced.get(k) or one_token[k])), re.I)
+            for k in survivors}
     base_count = dict.fromkeys(survivors, 0)
     for it in baseline:
         text = _doc_text(it)
+        # Any match collapses to its key, so a key absent from the collapsed text cannot
+        # match; this skips nearly every regex without changing a single count.
+        flat = collapse(text)
         for key, pat in pats.items():
-            if pat.search(text):
+            if key in flat and pat.search(text):
                 base_count[key] += 1
 
     # The wiki test is deliberately looser than the baseline test: also compare spelling-blind
@@ -218,7 +267,7 @@ def emerging_terms(window: Iterable[ItemLike], baseline: Iterable[ItemLike],
         if base_count[key] > MAX_BASELINE_ITEMS or pats[key].search(wiki_text) or key in wiki_flat:
             continue
         title_hits = sum(1 for _, _, tk in per_item if key in tk)
-        c = Candidate(display[key], key, len(seen_items[key]), len(seen_sources[key]),
+        c = Candidate(display(key), key, len(seen_items[key]), len(seen_sources[key]),
                       title_hits, base_count[key], len(seen_days[key]))
         c.score = c.sources * 3 + c.items + 2 * c.in_titles
         cands.append(c)
