@@ -16,6 +16,7 @@ The merge prompt's untrusted block neutralises delimiter variants and spoofed it
 The merge output guard rejects added HTML and id-less bullets; lint reports URLs and shell pipes.
 Small merge batches are quota-capped per source, and the HF papers fetcher selects by listing day.
 The radar filter's reply parser accepts candidate numbers or listed terms, fenced or not.
+HTML flattening stays linear on pages full of unclosed tags.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -648,6 +649,41 @@ def test_writing_modes_hold_the_run_lock_and_release_it_after():
             a.add_manual, a.load_env, sys.argv = saved
         assert seen == [False]                                      # held while the mode ran
         assert _lock_is_free()                                      # released when it returned
+
+
+def test_strip_html_is_linear_on_unclosed_tags():
+    """Pages full of unclosed "<" or "<script" flatten in well under a second, and ordinary
+    HTML flattens as before (the old patterns took 10 s on 200 KB of "<a")."""
+    import time
+    for raw in ("<a" * 1_000_000, "<script>" * 300_000, "<style" * 300_000):
+        start = time.monotonic()
+        a.strip_html(raw)
+        assert time.monotonic() - start < 2, raw[:10]
+    assert a.strip_html("<p>Hi <b>there</b></p><script>var a='<b>';</script>tail") == "Hi there \n tail"
+    assert a.strip_html("<SCRIPT type=x>hidden</SCRIPT >shown") == "shown"
+    assert a.strip_html("x<scripts>y</scripts>z") == "x y z"          # not a script element
+    assert a.strip_html("intro<script>never closed") == "intro"     # runs to the end, as a browser reads it
+    assert a.strip_html("<p>1 < 2 &amp; 3</p>") == "1 < 2 & 3"
+    # Not script elements: a custom element and a self-closed tag leave the page after them.
+    assert a.strip_html("<script-loader src=x></script-loader><p>Body</p>") == "Body"
+    assert a.strip_html('<p>Intro.</p><script src="t.js"/><p>Body text.</p>') == "Intro.\n Body text."
+    assert a.strip_html("a<!-- if a < b -->b") == "a b"                 # a "<" in a comment
+
+
+def test_title_lookup_is_linear_on_unclosed_tags():
+    """The h1 and title lookups take the first element, and a page of unclosed openers is fast."""
+    import time
+    for raw in ("<h1>" * 50_000, "<title>" * 30_000, "<h1 " * 50_000):
+        start = time.monotonic()
+        assert a.first_element(raw, raw[1:3] if raw[1] == "h" else "title", ignore_case=True) is None
+        assert time.monotonic() - start < 2, raw[:8]
+    page = "<head><title>T</title></head><H1 class=x>One</H1><h1>Two</h1>"
+    assert a.first_element(page, "h1") == "Two"                         # case-sensitive by default
+    assert a.first_element(page, "h1", ignore_case=True) == "One"
+    assert a.first_element(page, "title") == "T"
+    assert a.first_element("<h1x>no</h1x><h1>yes</h1>", "h1") == "yes"
+    # "İ".lower() is two characters; the slice must still end at the closing tag.
+    assert a.first_element("<title>İstanbul</title>", "title", ignore_case=True) == "İstanbul"
 
 
 def test_write_archive_body_cannot_forge_a_record_or_an_archived_url():
