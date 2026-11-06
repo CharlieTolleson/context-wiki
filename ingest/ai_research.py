@@ -11,7 +11,8 @@ Design notes:
     source keeps its old watermark so it self-heals.
   * INDEX.md is rewritten under a hard word cap. That cap is the forcing
     function that makes pruning happen, without it the model appends forever.
-  * archive/ is append-only and never pruned, so INDEX.md can prune freely.
+  * archive/ is append-only and never pruned, so INDEX.md can prune freely. The one exception is
+    a record's `published` line, which --check-dates --fix corrects and logs (correct_archive_dates).
   * Locations: WIKI_DATA_DIR holds INDEX.md and topics/; the archive and state default to
     the code repo (WIKI_ARCHIVE_DIR, WIKI_STATE_DIR). Settings come from the environment or .env.
   * Topic files: a section over SECTION_SPLIT_WORDS lives in topics/<slug>.md and INDEX.md keeps a
@@ -27,7 +28,12 @@ Design notes:
     the recent archive. Every removed claim is logged and RECALL.md reports gaps.
   * Items are merged MERGE_CHUNK at a time (merge_chunked), then prune_to_cap enforces WORD_CAP
     by asking a model which claims to DELETE (it never retypes the wiki).
-  * Thin items get the linked page's text (enrich_thin) before archiving.
+  * Each new item's page is fetched once before archiving (enrich_pages): thin items get its
+    text, and every item gets the publication date the page states (page_published_date).
+    Feed dates are only claims. Papers are dated by arXiv (date_papers).
+  * Citation dates in the wiki are derived, never trusted from the model: write_wiki sets each
+    one from the archive (sync_claim_dates). Lint compares wiki to archive; the date check
+    (check_dates, a share of the archive every run) compares archive to the sources.
 
 Usage:
     ai_research.py [--dry-run] [--since YYYY-MM-DD] [--backfill]
@@ -35,6 +41,7 @@ Usage:
     ai_research.py --rebuild-index   (re-store the wiki through the topic-file layout)
     ai_research.py --radar           (coverage report: watchlist gaps, emerging terms, recent drops)
     ai_research.py --prune           (bring an over-cap wiki back under the word cap)
+    ai_research.py --check-dates [--source NAME] [--fix]   (verify archive dates against their sources)
     ai_research.py --add-url URL [--source NAME]
     ai_research.py --add-note TEXT --title TITLE [--source NAME]
 """
@@ -64,9 +71,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import zlib
 from dataclasses import dataclass
 from typing import Callable, Iterable
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 
@@ -135,6 +143,7 @@ LOCK_PATH = STATE_DIR / "run.lock"
 # atomic_write temp files start with this, so the orphan sweep and a vault .gitignore can match
 # ours alone: WIKI_DIR is often a vault folder that other tools (Syncthing, editors) also use.
 TEMP_PREFIX = ".ctxwiki."
+DATE_CORRECTIONS_PATH = STATE_DIR / "date_corrections.jsonl"   # every archive date --fix changed, with the old value
 # Optional separate file for the endpoint credentials, so secrets can live in one shared place.
 ENV_PATH = Path(setting("WIKI_ENV_FILE", str(LOCAL_ENV))).expanduser()
 # Concepts that must be covered; see radar.parse_watchlist for the format.
@@ -161,8 +170,10 @@ RADAR_WINDOW_DAYS = 21   # "recent" for emerging-term detection; older archive i
 RADAR_MODEL = setting("WIKI_RADAR_MODEL", "cheap")   # small model: filters candidate terms, never writes the wiki
 RADAR_SEARCH_TERMS = 8   # max terms per run sent to targeted Hacker News search
 RADAR_WATCHLIST_SLOTS = 5  # of those, at most this many go to missing watchlist concepts, so emerging terms always get some
-ENRICH_LIMIT = 40        # max thin items per run whose page text is fetched
+ENRICH_LIMIT = 80        # max pages fetched per run, for thin text and publication dates; a normal day needs 20 to 40
 ENRICH_MIN_BODY = 500    # a body shorter than this is "thin" and worth a page fetch
+DATE_CHECK_CYCLE_DAYS = 30   # each daily run re-verifies this fraction of the archive, so every record once a cycle
+DATE_CHECK_SHOWN = 12    # findings spelled out in one LINT line; the rest are counted
 USER_AGENT = "wiki-ai-research/1.0 (personal context wiki)"
 
 # HN's front page is a firehose, an unfiltered points>100 query returns obituaries,
@@ -265,6 +276,7 @@ SOURCE_KEYWORDS = {"vercel", "replit", "aws-ml", "together-ai", "ms-foundry", "g
 # unreviewed: a later run offers them again only if it searches the same term and HN still
 # returns them, and otherwise --backfill reaches them.
 SOURCE_QUOTA = {"hf-daily-papers": 3, "hackernews": 10, "hn-radar": 8}
+PAPER_SOURCE = "hf-daily-papers"   # dated by arXiv (date_papers), not by its page
 
 ATOM = "{http://www.w3.org/2005/Atom}"
 CONTENT_NS = "{http://purl.org/rss/1.0/modules/content/}"
@@ -290,7 +302,7 @@ class Item:
         # The archive stores the url through archive_field, which collapses whitespace, so
         # dedupe must compare that same form. Normalising here, where every fetcher, --add-url
         # and read_archive build an Item, means the batch check, the archived-url check, the
-        # revive lookup and enrich_thin all see the stored url. Comparing the raw url let a feed
+        # revive lookup and enrich_pages all see the stored url. Comparing the raw url let a feed
         # url holding a newline or other whitespace miss dedupe and be re-archived and
         # re-merged every run.
         self.url = archive_field(self.url)
@@ -567,7 +579,7 @@ def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...]
 
     Every fetcher goes through here: the feed, HN, HF papers, and html_index
     fetchers (fixed public https SOURCES, so allow_private stays True), and
-    enrich_thin and fetch_one_url (allow_private=False: their URLs come from
+    enrich_pages and fetch_one_url (allow_private=False: their URLs come from
     untrusted feeds or are typed by a person or an agent via the wiki-add skill).
 
     With allow_private=False the address actually connected to is checked at
@@ -575,7 +587,7 @@ def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...]
     unchecked, resolution). The whole request (connect, headers, every redirect
     hop, and the body) runs against a wall-clock FETCH_DEADLINE, because
     HTTP_TIMEOUT bounds each socket call, so a server trickling one byte at a time
-    could otherwise hold the run (and enrich_thin's pool) open forever.
+    could otherwise hold the run (and enrich_pages's pool) open forever.
 
     Args:
         url: http or https URL to fetch.
@@ -651,7 +663,12 @@ def http_get(url: str, allow_private: bool = True, accept_types: tuple[str, ...]
 
 
 def parse_date(raw: str | None) -> datetime | None:
-    """Parse RFC-822 (RSS pubDate) or ISO-8601 (Atom/JSON) into aware UTC."""
+    """Parse RFC-822 (RSS pubDate) or ISO-8601 (Atom/JSON) into an aware datetime.
+
+    The source's own UTC offset is kept, because `.date()` on the result is what gets
+    archived and cited. Converting to UTC moved a post stamped 2026-10-04T23:28:00-05:00,
+    dated October 4 on its own page, to October 5. A value with no offset is taken as UTC.
+    """
     if not raw:
         return None
     raw = raw.strip()
@@ -675,11 +692,232 @@ def parse_date(raw: str | None) -> datetime | None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(timezone.utc)
+    return dt
 
 
 def text_of(node) -> str:
     return (node.text or "").strip() if node is not None else ""
+
+
+# ── Publication dates ───────────────────────────────────────────────────────
+
+# What a page says about itself, read from metadata only. A 2026-11-05 audit set each signal
+# against the 13 sources whose feed dates are sound: JSON-LD article nodes and publish-time meta
+# tags matched on 272 of 274 pages, and the other two are posts their own site re-dated after
+# publishing. The first bare <time> element matched on only 81%, because it is often something
+# else on the page (a related post, on openai.com), so it is deliberately not read here.
+# Positional scraping is what put the wrong date on 22 Anthropic posts (see index_card_dates).
+#
+# These patterns run on untrusted pages of up to MAX_FETCH_BYTES, so each quantifier is bounded:
+# an unbounded [^>]* costs quadratic time on a page built to exploit it.
+LD_OPEN_RE = re.compile(r"<script\b[^>]{0,300}application/ld\+json[^>]{0,300}>", re.I)
+META_TAG_RE = re.compile(r"<meta\b[^>]{0,1000}>", re.I)
+TAG_ATTR_RE = re.compile(r"""([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+# JSON-LD @type names that describe the page's own content, matched as substrings so that
+# BlogPosting, NewsArticle, TechArticle, SocialMediaPosting and the like are all covered.
+# Comment is left out on purpose: comments carry a datePublished of their own.
+LD_ARTICLE_TYPES = ("Article", "Posting", "WebPage", "PodcastEpisode", "VideoObject", "CreativeWork")
+# Meta tag names, strongest first. arXiv's citation_date is the first version; its
+# citation_online_date follows the latest revision, so that one is not listed.
+PAGE_DATE_META = ("article:published_time", "og:article:published_time", "og:published_time",
+                  "datepublished", "parsely-pub-date", "citation_publication_date", "citation_date",
+                  "dc.date.issued", "dcterms.issued")
+EARLIEST_PAGE_YEAR = 1990   # a date before the web is a placeholder (0001-01-01, the Unix epoch)
+MAX_DATE_CHARS = 64         # no real date is longer; refuse before parsing outside text
+
+
+def plausible_page_date(raw: str) -> datetime | None:
+    """Parse one metadata date from an outside page, or None if it cannot be a real one.
+
+    Args:
+        raw: The attribute or JSON string as found on the page (untrusted).
+
+    Returns:
+        An aware datetime no earlier than EARLIEST_PAGE_YEAR and not in the future (one day
+        of slack, for time zones ahead of UTC). Only the parsed value ever leaves this
+        function, so page text cannot reach the archive or the merge prompt through a date.
+    """
+    if len(raw) > MAX_DATE_CHARS:
+        return None
+    # Hugo escapes the + of an offset (&#43;), and arXiv writes dates as 2026/02/16.
+    dt = parse_date(html.unescape(raw).strip().replace("/", "-"))
+    if dt is None or dt.year < EARLIEST_PAGE_YEAR:
+        return None
+    return dt if dt <= datetime.now(timezone.utc) + timedelta(days=1) else None
+
+
+def ld_blocks(page: str) -> Iterable[str]:
+    """The text of each JSON-LD script on a page.
+
+    A plain scan, not one regex: a lazy `.*?</script>` re-reads the rest of the page for every
+    unclosed opening tag, so a hostile page could stall the run. This reads the page once.
+
+    Args:
+        page: Raw HTML.
+
+    Yields:
+        The contents of each closed script block, in page order.
+    """
+    pos = 0
+    while (opening := LD_OPEN_RE.search(page, pos)):
+        end = page.find("</script>", opening.end())
+        if end < 0:
+            return
+        yield page[opening.end():end]
+        pos = end
+
+
+def ld_article_dates(page: str) -> list[datetime]:
+    """`datePublished` of every article-like JSON-LD node on a page.
+
+    Args:
+        page: Raw HTML.
+
+    Returns:
+        The dates found, in no particular order. A block that does not parse is skipped:
+        invalid JSON-LD is common, and the meta tags may still answer.
+    """
+    found: list[datetime] = []
+    for block in ld_blocks(page):
+        try:
+            stack = [json.loads(block, strict=False)]
+        except (ValueError, RecursionError):
+            continue
+        while stack:
+            node = stack.pop()
+            if isinstance(node, list):
+                stack.extend(node)
+            elif isinstance(node, dict):
+                kinds = node.get("@type")
+                kinds = kinds if isinstance(kinds, list) else [kinds]
+                if isinstance(node.get("datePublished"), str) and any(
+                        t in str(k) for k in kinds for t in LD_ARTICLE_TYPES):
+                    dt = plausible_page_date(node["datePublished"])
+                    if dt:
+                        found.append(dt)
+                stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+    return found
+
+
+def page_published_date(page: str) -> datetime | None:
+    """The publication date a page states about itself, from structured metadata only.
+
+    Args:
+        page: Raw HTML of the article.
+
+    Returns:
+        The date from JSON-LD, else from the first PAGE_DATE_META tag present, else None.
+        JSON-LD nodes that disagree with each other are ignored (a listing page, usually):
+        no date beats a guess, because a wrong date looks exactly like a right one.
+    """
+    dates = ld_article_dates(page)
+    if len({d.date() for d in dates}) == 1:
+        return dates[0]
+    meta: dict[str, datetime] = {}
+    for tag in META_TAG_RE.findall(page):
+        attrs = {k.lower(): a or b for k, a, b in TAG_ATTR_RE.findall(tag)}
+        name = (attrs.get("property") or attrs.get("name") or attrs.get("itemprop") or "").lower()
+        if name in PAGE_DATE_META and name not in meta and attrs.get("content"):
+            dt = plausible_page_date(attrs["content"])
+            if dt:
+                meta[name] = dt
+    return next((meta[n] for n in PAGE_DATE_META if n in meta), None)
+
+
+def best_publication_date(current: datetime, stated: datetime | None, first_seen: date) -> datetime:
+    """Decide between the date a record carries and the date its own page states.
+
+    Used for new items and for archive checks, so the two can never disagree about what a
+    correct date is. Across the whole archive it changes no record from the 13 sources whose
+    feed dates are sound, which is what makes it safe to apply to every source.
+
+    Args:
+        current: The date from the feed, from Hacker News, or from the archive.
+        stated: page_published_date() for the item, or None.
+        first_seen: The day the item was first fetched. Nothing is published after it was
+            already seen, so a later date is a page re-dated afterwards (Latent Space does this).
+
+    Returns:
+        `stated` when it is earlier than `current`: a feed that restamps edited posts and a
+        Hacker News submission both run late. Also when it is more than a day later, which is
+        what a date read from the wrong element looks like. Otherwise `current`, since one day
+        later is time-zone noise or a page re-dated soon after publishing.
+    """
+    if stated is None or stated.date() > first_seen:
+        return current
+    gap = (stated.date() - current.date()).days
+    return stated if gap < 0 or gap > 1 else current
+
+
+# arXiv asks API clients for at most one request every three seconds. Its id_list takes many
+# ids per call, so a normal day's papers are one request.
+ARXIV_API = "https://export.arxiv.org/api/query"
+ARXIV_BATCH = 100
+ARXIV_PAUSE_SECONDS = 3
+ARXIV_PAPER_RE = re.compile(r"/papers/(\d{4}\.\d{4,6})$")
+ARXIV_ENTRY_RE = re.compile(r"/abs/(\d{4}\.\d{4,6})")
+
+
+def arxiv_first_published(ids: list[str]) -> dict[str, datetime]:
+    """When each paper's first version appeared, from arXiv itself.
+
+    Hugging Face's dates follow the latest revision: of 1,065 archived papers, 272 had more than
+    one version, and one listed in 2026-10 was first posted in 2025-09.
+
+    Args:
+        ids: arXiv ids, already validated by ARXIV_PAPER_RE. They come from Hugging Face's API,
+            so the pattern is what makes them safe to put in a URL.
+
+    Returns:
+        {arxiv id: first-version datetime} for every id arXiv answered. A failed request is
+        logged and leaves its ids out, because a paper with no answer keeps the date it has.
+    """
+    dates: dict[str, datetime] = {}
+    for start in range(0, len(ids), ARXIV_BATCH):
+        if start:
+            time.sleep(ARXIV_PAUSE_SECONDS)
+        chunk = ids[start:start + ARXIV_BATCH]
+        try:
+            root = parse_xml(http_get(f"{ARXIV_API}?id_list={','.join(chunk)}&max_results={len(chunk)}"))
+        except Exception as exc:   # this runs outside the per-source guard in main, and is never worth a run
+            log(f"  WARN arxiv lookup of {len(chunk)} id(s): {type(exc).__name__}")
+            continue
+        for entry in root.findall(f"{ATOM}entry"):
+            m = ARXIV_ENTRY_RE.search(text_of(entry.find(f"{ATOM}id")))
+            pub = parse_date(text_of(entry.find(f"{ATOM}published")))
+            if m and pub:
+                dates[m.group(1)] = pub
+    return dates
+
+
+def arxiv_papers(items: list[Item]) -> dict[str, Item]:
+    """The papers among `items`, keyed by arXiv id. Anything else, or any other URL shape, is left out."""
+    papers: dict[str, Item] = {}
+    for it in items:
+        m = ARXIV_PAPER_RE.search(it.url)
+        if it.source == PAPER_SOURCE and m:
+            papers[m.group(1)] = it
+    return papers
+
+
+def date_papers(items: list[Item]) -> int:
+    """Give paper items the date of their first arXiv version.
+
+    Args:
+        items: Any items; only papers with an arXiv URL are touched.
+
+    Returns:
+        The number of papers arXiv dated. The rest keep Hugging Face's date, and the
+        daily date check flags them later.
+    """
+    papers = arxiv_papers(items)
+    found = arxiv_first_published(sorted(papers))
+    for arxiv_id, pub in found.items():
+        if arxiv_id in papers:
+            papers[arxiv_id].published = pub
+    if len(found) < len(papers):
+        log(f"  WARN papers: {len(papers) - len(found)} of {len(papers)} keep Hugging Face's date")
+    return len(found)
 
 
 # ── Fetchers ────────────────────────────────────────────────────────────────
@@ -707,6 +945,10 @@ def fetch_feed(name: str, slug: str, url: str, since: datetime) -> list[Item]:
     Filters on *published* where available so an edited old post does not
     resurface. Items with an unparseable date are included, the merge step
     absorbs the occasional duplicate.
+
+    A date here is only what the feed claims. Google's feed has no dates at all, so its
+    items carry the fetch time, and LangChain's restamps a post on every edit; enrich_pages
+    settles both from the article's own page before anything is archived.
     """
     root = parse_xml(http_get(url))
     items: list[Item] = []
@@ -801,7 +1043,12 @@ def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Ite
     against the watermark dropped nearly every paper (0 per run for a week straight
     in October 2026). The day loop already starts at the watermark day, and
     write_archive drops any URL that is already archived, so re-reading the watermark
-    day costs nothing. `publishedAt` is kept on the item for attribution.
+    day costs nothing.
+
+    The date is `paper.publishedAt`, not the entry's own `publishedAt`, which is the same
+    value moved back into the previous day by a US Eastern offset. Either one follows the
+    latest arXiv revision, so date_papers replaces it with the first version's date; this
+    one is what a paper keeps when arXiv cannot be reached.
 
     Raises:
         RuntimeError: when any listing day failed. Swallowing the error let main()
@@ -824,7 +1071,8 @@ def fetch_hf_papers(name: str, slug: str, url: str, since: datetime) -> list[Ite
         for entry in data:
             paper = entry.get("paper", {}) or {}
             pid = paper.get("id", "")
-            pub = parse_date(entry.get("publishedAt")) or datetime.now(timezone.utc)
+            pub = (parse_date(paper.get("publishedAt")) or parse_date(entry.get("publishedAt"))
+                   or datetime.now(timezone.utc))
             items.append(Item(
                 name, slug,
                 entry.get("title") or paper.get("title", ""),
@@ -843,49 +1091,38 @@ ARTICLE_DATE_RE = re.compile(
 )
 
 
-INDEX_LINK_RE = re.compile(r'href="(/engineering/[a-z0-9-]+)"')
-# How far past a link the card's own date may sit. A card is a title, a teaser, and a
-# date; 1200 characters of markup covers that with room to spare.
-CARD_DATE_SPAN = 1200
+# Articles moved from /engineering/<slug> to /research/<slug> some time after 2026-10-14. The old
+# URLs redirect, and archived records keep them, so both spellings name the same article.
+INDEX_LINK_RE = re.compile(r'href="(/(?:engineering|research)/[A-Za-z0-9-]+)"')
+INDEX_CARD_RE = re.compile(r"<article\b.*?</article>", re.S | re.I)
 
 
 def index_card_dates(index_html: str) -> dict[str, datetime]:
     """Publication date per article path, read from the cards on a link-index page.
 
-    Each card on the index puts its date AFTER the article link (title, teaser, date),
-    and the cards run newest-first. A date is therefore bound to the link it follows:
-    the search runs forward from the link and stops at the next link to a DIFFERENT
-    article, so it can never read past the end of the card. (A card may link to the
-    same article twice, image plus title, which is why "different" matters.)
-
-    The earlier version searched a window that started 600 characters BEFORE the link,
-    so the first date it met was the previous, newer card's date. Every Anthropic item
-    archived through 2026-10-15 carries the date of the card above it for that reason.
+    A card is an <article> element, so a date is bound to a link by sitting inside the
+    same element, wherever the two fall within it. Reading by position has now failed in
+    both directions: a window that opened 600 characters before each link gave 22 Anthropic
+    posts the date of the card above them, and the fix for that searched forward from the
+    link, which reads the card BELOW since the 2026-10 redesign moved the date ahead of it.
 
     Args:
         index_html: The raw HTML of the index page.
 
     Returns:
-        {"/engineering/<slug>": aware UTC datetime} for every link whose card shows a
-        parseable date. Links with no date in their card are left out, and the caller
-        falls back to scanning the article page.
+        {"/research/<slug>": aware datetime} for every card holding exactly one article and
+        one date. A card with no date, or more than one candidate, is left out: this is
+        only a cross-check and fallback for page_published_date.
     """
-    links = list(INDEX_LINK_RE.finditer(index_html))
     dates: dict[str, datetime] = {}
-    for i, m in enumerate(links):
-        path = m.group(1)
-        if path in dates:
-            continue
-        end = m.end() + CARD_DATE_SPAN
-        for nxt in links[i + 1:]:
-            if nxt.group(1) != path:
-                end = min(end, nxt.start())
-                break
-        d = ARTICLE_DATE_RE.search(index_html, m.end(), end)
-        if d:
-            parsed = parse_date(f"{d.group(1)} {d.group(2)} {d.group(3)}")
+    for card in INDEX_CARD_RE.findall(index_html):
+        paths = set(INDEX_LINK_RE.findall(card))
+        found = {m.groups() for m in ARTICLE_DATE_RE.finditer(card)}
+        if len(paths) == 1 and len(found) == 1:
+            mon, day, year = found.pop()
+            parsed = parse_date(f"{mon} {day} {year}")
             if parsed:
-                dates[path] = parsed
+                dates[paths.pop()] = parsed
     return dates
 
 
@@ -916,30 +1153,36 @@ def finished_urls() -> set[str]:
 def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[Item]:
     """Scrape a link-index page whose articles have no feed.
 
-    Novelty is by URL, not by the date watermark: this is a slowly-changing
+    Novelty is by URL slug, not by the date watermark: this is a slowly-changing
     canonical corpus (Anthropic's engineering posts on agents, context, evals,
     retrieval), and most of it predates any sensible lookback window. The
     watermark would exclude exactly the material we most want. Real publication
-    dates are still scraped per-article for attribution.
+    dates are still read per-article for attribution.
 
     Only URLs a merge has already seen are skipped. Skipping every archived URL meant an
     article whose merge chunk failed was never offered again (holding the watermark does
     nothing for a source that ignores it).
+
+    Raises:
+        RuntimeError: the index yielded no article links. That means the layout changed,
+            not that nothing is new: after the 2026-10 redesign this source returned
+            nothing, with no warning, because the link pattern matched nothing.
     """
     base = "https://www.anthropic.com"
     index_html = http_get(url).decode("utf-8", errors="replace")
-    slugs = sorted(set(INDEX_LINK_RE.findall(index_html)))
-    already = finished_urls()
-
-    # The index lists a date beside each link; that is more reliable than
-    # scraping the article page, where some posts carry no date at all and the
-    # first date-shaped match can belong to an unrelated element.
+    paths = sorted(set(INDEX_LINK_RE.findall(index_html)))
+    if not paths:
+        raise RuntimeError("no article links on the index page; its layout has probably changed")
+    # By slug, not full URL: an article archived under /engineering/ is listed under
+    # /research/ now, and comparing URLs would archive every old post a second time.
+    already = {u.rsplit("/", 1)[-1] for u in finished_urls() if u.startswith(base + "/")}
+    archived = {u.rsplit("/", 1)[-1]: u for u in archived_urls() if u.startswith(base + "/")}
     index_dates = index_card_dates(index_html)
 
     items: list[Item] = []
-    for path in slugs:
+    for path in paths:
         full = base + path
-        if full in already:
+        if path.rsplit("/", 1)[-1] in already:
             continue
         try:
             page = http_get(full).decode("utf-8", errors="replace")
@@ -950,16 +1193,20 @@ def fetch_html_index(name: str, slug: str, url: str, since: datetime) -> list[It
         prose = "\n\n".join(l.strip() for l in text.split("\n") if len(l.strip()) > 100)
         if len(prose) < 400:
             continue
-        pub = index_dates.get(path)
+        # The article's own metadata decides. The card is a second, independent reading,
+        # so a disagreement means one of the two parsers has broken again: say so.
+        pub, card = page_published_date(page), index_dates.get(path)
+        if pub and card and pub.date() != card.date():
+            log(f"  WARN {name}: {path} is dated {pub.date()} by its page, {card.date()} by its card")
+        pub = pub or card
         if pub is None:
-            m = ARTICLE_DATE_RE.search(page)
-            if m:
-                pub = parse_date(f"{m.group(1)} {m.group(2)} {m.group(3)}")
+            log(f"  WARN {name}: {path} has no publication date; using today's")
         title = path.rsplit("/", 1)[-1].replace("-", " ").title()
         h1 = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.S)
         if h1:
             title = strip_html(h1.group(1)) or title
-        items.append(Item(name, slug, title, full,
+        # An unmerged article keeps the URL it was archived under, or write_archive cannot re-offer it.
+        items.append(Item(name, slug, title, archived.get(path.rsplit("/", 1)[-1], full),
                           pub or datetime.now(timezone.utc), prose[:MAX_BODY_CHARS]))
     return items
 
@@ -1012,6 +1259,7 @@ TOPIC_MARK = re.compile(r"<!--\s*topic-file:\s*(\S+)\s*-->")
 TOPIC_FILE_RE = re.compile(r"topics/[a-z0-9-]+\.md")
 SECTION_RE = re.compile(r"^## (.+?)[ \t]*$", re.M)
 CLAIM_DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) \[")
+CITATION_RE = re.compile(r"(\d{4}-\d{2}-\d{2}) \[([^\]]+)\]")   # the date and ids that end a claim
 
 
 def slugify(title: str) -> str:
@@ -1179,7 +1427,57 @@ def _generated_topic(path: Path) -> bool:
         return False
 
 
-def write_wiki(md: str) -> None:
+def archived_citation_date(ids: str, facts: dict[str, tuple[str, bool]]) -> str | None:
+    """The date a citation should show: its item's published date, or its newest source's.
+
+    Args:
+        ids: The text inside a citation's brackets.
+        facts: archive_facts() output.
+
+    Returns:
+        A YYYY-MM-DD string, or None if no cited id is in the archive.
+    """
+    dates = [facts[i][0] for i in ID_RE.findall(ids) if i in facts]
+    return max(dates) if dates else None
+
+
+def sync_claim_dates(md: str, facts: dict[str, tuple[str, bool]] | None = None) -> str:
+    """Set the date of every citation from the archive, so no model's copy of it survives.
+
+    A citation date is derived data, and the merge model retypes it on every run. It has
+    written the run date embedded in the item id (2026-11-02 for an item published the day
+    before) and changed a year (2026-01-06 for 2025-01-06), and each such claim stayed wrong.
+    This is also what carries a corrected archive date into the wiki.
+
+    Args:
+        md: Wiki text.
+        facts: archive_facts() output; None reads the archive now. With no archive there is
+            nothing to compare against and the text is returned unchanged.
+
+    Returns:
+        `md` with the date before each `[ids]` group replaced in bullet lines. Citations of
+        ids the archive does not know are left alone for lint_index to report.
+    """
+    if facts is None:
+        facts = archive_facts()
+    changed = 0
+
+    def fix(m: re.Match) -> str:
+        nonlocal changed
+        want = archived_citation_date(m.group(2), facts)
+        if want is None or want == m.group(1):
+            return m.group(0)
+        changed += 1
+        return f"{want} [{m.group(2)}]"
+
+    lines = [CITATION_RE.sub(fix, ln) if ln.lstrip().startswith(("- ", "* ")) else ln
+             for ln in md.split("\n")]
+    if changed:
+        log(f"dates: {changed} citation date(s) set from the archive")
+    return "\n".join(lines)
+
+
+def write_wiki(md: str) -> str:
     """Store a wiki document, moving any section over SECTION_SPLIT_WORDS into its own file.
 
     Order of writes is topic files, then INDEX.md, then deletion of files nothing points
@@ -1189,7 +1487,14 @@ def write_wiki(md: str) -> None:
     (a model echoing one it saw, or one planted through feed text) is stripped before the
     body is stored, so read_wiki() on the next run never meets a marker this code did not
     write. The strip is logged, never silent.
+
+    Every write path comes through here, so this is also where citation dates are made to
+    match the archive (sync_claim_dates).
+
+    Returns:
+        The text stored after the date sync, which is what callers should lint.
     """
+    md = sync_claim_dates(md)
     preamble, sections = parse_sections(md)
     if preamble:
         log("WARN text before the first section heading was dropped")
@@ -1226,6 +1531,7 @@ def write_wiki(md: str) -> None:
         if not any(TOPICS_DIR.iterdir()):
             TOPICS_DIR.rmdir()
     log(f"layout: {len(sections)} sections, {len(keep)} in topic files")
+    return md
 
 
 def merged_ids() -> set[str]:
@@ -1267,7 +1573,8 @@ def archive_body(body: str) -> str:
 
 
 def write_archive(items: list[Item], run_date: str) -> Path:
-    """Append full item records. Append-only; never rewritten or pruned.
+    """Append full item records. Append-only; never pruned, and only correct_archive_dates
+    rewrites anything, one `published` line at a time.
 
     Skips URLs already archived. Watermarks normally prevent re-fetching, but
     they are reset by `--since`, a deleted state.json, or a source (like the
@@ -1303,11 +1610,14 @@ def write_archive(items: list[Item], run_date: str) -> Path:
                     i.revived = True
                     i.retry = prev.item_id in retry["pending"]
                     # The refetch usually carries only the feed's title or teaser, and
-                    # enrich_thin skips archived URLs, so without this the merge would see
+                    # enrich_pages skips archived URLs, so without this the merge would see
                     # the thin body, reject it, and the archived full text would never be used.
                     if (len(prev.body) > len(i.body or "")
                             and not prev.body.startswith(NO_BODY_PLACEHOLDER)):
                         i.body = prev.body
+                    # The archive's date, not today's fetch: a dateless feed gives the fetch
+                    # time here and a restamping feed the last edit, and the merge would copy it.
+                    i.published = prev.published
                     revived += 1
                 continue  # never append a second copy
         fresh.append(i)
@@ -2812,8 +3122,7 @@ def backfill(creds: dict[str, str], since: datetime | None = None) -> int:
         if not updated:
             log(f"ERROR pass {n} returned empty output; stopping")
             return 1
-        updated = prune_to_cap(updated, creds, min_floor=run_floor)
-        write_wiki(updated)
+        updated = write_wiki(prune_to_cap(updated, creds, min_floor=run_floor))
         reviewed.update(i.item_id for i in batch)
         atomic_write(REVIEWED_PATH, json.dumps(sorted(reviewed)) + "\n")
         log(f"  -> {len(updated.split())} words")
@@ -2871,7 +3180,9 @@ def lint_index(md: str, known_ids: set[str],
     The merge rules the model is asked to follow (dedupe, supersession, word
     cap) are editorial judgements it can and does silently skip. These checks
     make the failures visible in the run log instead of letting them accrete.
-    Reported, not auto-fixed, git history is the audit trail.
+    Reported, not auto-fixed, git history is the audit trail. The exception is citation
+    dates, which write_wiki sets from the archive; the date check here stays as the alarm
+    for text that reached the wiki some other way.
 
     Args:
         md: The wiki text the merge returned (what write_wiki stored).
@@ -2913,21 +3224,24 @@ def lint_index(md: str, known_ids: set[str],
         if unknown:
             problems.append(f"unknown item id(s), possibly fabricated: {', '.join(unknown)}")
 
-        # A claim citing one item must carry that item's published date. A rewrite on
-        # 2026-10-15 silently turned a 2025-01-06 citation into 2026-01-06; a merge that
-        # changes a date it was told to copy is the same failure as inventing an id.
-        # Multi-id claims are skipped: their date is that of the newest source by design.
+        # A claim must carry its item's published date, or its newest source's when it cites
+        # several. A rewrite on 2026-10-15 silently turned a 2025-01-06 citation into
+        # 2026-01-06; a merge that changes a date it was told to copy is the same failure as
+        # inventing an id.
         misdated: list[str] = []
+        unreadable = 0
         for b in bullets:
-            cited = set(ID_RE.findall(b))
-            if len(cited) != 1:
-                continue
-            cid = next(iter(cited))
-            m = CLAIM_DATE_RE.search(b)
-            if cid in facts and m and m.group(1) != facts[cid][0]:
-                misdated.append(f"{cid} cited {m.group(1)}, archived {facts[cid][0]}")
+            citations = CITATION_RE.findall(b)
+            unreadable += bool(ID_RE.search(b)) and not citations
+            for shown, ids in citations:
+                want = archived_citation_date(ids, facts)
+                if want and want != shown:
+                    misdated.append(f"{ids} cited {shown}, archived {want}")
         if misdated:
             problems.append(f"claim date differs from the archive: {'; '.join(misdated)}")
+        if unreadable:
+            problems.append(f"{unreadable} claim(s) cite ids with no `date [ids]` attribution, so their "
+                            "date cannot be checked")
 
         # A record with no body gave the merge only a title to work from, so a claim built on
         # it is a guess. Worth fetching the full text (--add-url) and re-merging.
@@ -2999,39 +3313,60 @@ def extract_prose(page: str) -> str:
     return prose if len(prose) >= 200 else ""
 
 
-def enrich_thin(items: list[Item]) -> int:
-    """Replace a thin body with the linked page's text, in parallel, for up to ENRICH_LIMIT items.
+def has_article_page(it: Item) -> bool:
+    """True if the item links to a page of its own, rather than a note or an HN discussion."""
+    return it.url.startswith("http") and "news.ycombinator.com/item" not in it.url
 
-    Why: HN items arrive with only a title and a points line, and several feeds ship a
+
+def enrich_pages(items: list[Item]) -> int:
+    """Fetch each item's page once, in parallel: thin bodies get its text, every item its date.
+
+    Why the text: HN items arrive with only a title and a points line, and several feeds ship a
     one-sentence summary. The merge cannot extract a practice from a title, so thin items
     could never qualify for the wiki. Fetching the page fixes that for the cost of one GET.
-    Failures are silent by design (paywalls, 403s, JS pages): the item keeps its old body.
+    Why the date: only the page knows when the article appeared. Hacker News dates the
+    submission (a 2023 essay posted in 2026 read as new), LangChain's feed restamps every edit,
+    and Google's has no dates. See best_publication_date for which date wins.
+    Failures are silent by design (paywalls, 403s, JS pages): the item keeps what it had.
     Article links come from feeds and Hacker News, i.e. from the open internet, so every fetch
     uses allow_private=False (the SSRF guard): a link to localhost or a LAN address is refused.
+
+    Args:
+        items: New items. At most ENRICH_LIMIT pages are fetched, thin items first since they
+            need the page most; the rest keep their feed date until the daily date check.
 
     Returns:
         The number of items whose body was replaced.
     """
     from concurrent.futures import ThreadPoolExecutor
 
-    todo = [i for i in items if len(i.body) < ENRICH_MIN_BODY and i.url.startswith("http")
-            and "news.ycombinator.com/item" not in i.url][:ENRICH_LIMIT]
+    linked = [i for i in items if has_article_page(i)]
+    thin = [i for i in linked if len(i.body) < ENRICH_MIN_BODY]
+    # A paper's date comes from arXiv, so a full abstract gives no reason to fetch its page.
+    full = [i for i in linked if len(i.body) >= ENRICH_MIN_BODY and i.source != PAPER_SOURCE]
+    todo = (thin + full)[:ENRICH_LIMIT]
 
     def grab(it: Item) -> tuple[Item, str]:
         try:
-            page = http_get(it.url, allow_private=False, accept_types=HTML_TYPES)
-            return it, extract_prose(page.decode("utf-8", errors="replace"))
+            return it, http_get(it.url, allow_private=False, accept_types=HTML_TYPES).decode("utf-8", errors="replace")
         except Exception:
             return it, ""
 
-    done = 0
+    done = redated = 0
+    today = datetime.now(timezone.utc).date()
     with ThreadPoolExecutor(max_workers=8) as pool:
-        for it, prose in pool.map(grab, todo):
+        for it, page in pool.map(grab, todo):
+            prose = extract_prose(page) if len(it.body) < ENRICH_MIN_BODY else ""
             if prose:
                 # keep the original body (it carries the HN points line) after the article text
                 it.body = (prose[:MAX_BODY_CHARS - 300] + "\n\n" + it.body)[:MAX_BODY_CHARS]
                 done += 1
-    log(f"enrich: {done} of {len(todo)} thin items given page text")
+            if it.source != PAPER_SOURCE:
+                best = best_publication_date(it.published, page_published_date(page), today)
+                redated += best != it.published
+                it.published = best
+    log(f"enrich: {len(todo)} pages fetched, {done} thin items given text, {redated} dated from their page"
+        + (f", {len(thin) + len(full) - len(todo)} over the limit" if len(thin) + len(full) > len(todo) else ""))
     return done
 
 
@@ -3062,8 +3397,11 @@ def fetch_one_url(url: str, source: str | None) -> Item:
             if title:
                 break
     host = urllib.parse.urlparse(url).netloc.replace("www.", "")
-    m = ARTICLE_DATE_RE.search(page)
-    pub = parse_date(f"{m.group(1)} {m.group(2)} {m.group(3)}") if m else None
+    pub = page_published_date(page)
+    if pub is None:   # a page with no metadata: the first date-shaped text beats today's date, usually
+        m = ARTICLE_DATE_RE.search(page)
+        pub = parse_date(f"{m.group(1)} {m.group(2)} {m.group(3)}") if m else None
+        log("NOTE no publication date in the page's metadata; check the date on the item line below")
     return Item(source or host, "mn", title or url, url,
                 pub or datetime.now(timezone.utc), prose[:MAX_BODY_CHARS])
 
@@ -3118,7 +3456,7 @@ def add_manual(url: str | None, note: str | None, title: str | None,
         return 1
 
     before = index_md
-    write_wiki(updated)
+    updated = write_wiki(updated)
     log(f"INDEX.md rewritten: {len(updated.split())} words (cap {WORD_CAP})")
     lint_index(updated, {item.item_id}, archive_facts())
     if item.item_id and item.item_id not in updated:
@@ -3128,6 +3466,170 @@ def add_manual(url: str | None, note: str | None, title: str | None,
         log("NOTE INDEX.md unchanged by this item.")
     commit(run_date, 1)
     return 0
+
+
+# ── Date check ──────────────────────────────────────────────────────────────
+
+# Lint compares the wiki with the archive, so it cannot see an archive that is itself wrong, and
+# 1,129 of 2,151 records were, through seven different causes, while lint stayed quiet. This check
+# compares the archive with the sources: arXiv for papers, each article's own page for the rest.
+
+
+@dataclass
+class DateFinding:
+    """One archive record whose date disagrees with its source."""
+    item: Item
+    expected: datetime
+    evidence: str   # where `expected` came from, for the log and the corrections ledger
+
+
+def is_ingest_stamp(it: Item) -> bool:
+    """True if a record's date is the moment it was archived rather than a publication date.
+
+    Every fetcher falls back to datetime.now() when it finds no date, and that is the only
+    thing that writes a timestamp with microseconds on the run's own date. Notes are exempt:
+    the day a note was written is its date.
+    """
+    return bool(it.url) and it.published.microsecond != 0 and it.published.date().isoformat() == it.item_id[:10]
+
+
+def check_dates(items: list[Item]) -> tuple[list[DateFinding], int]:
+    """Compare records with the date their source states, however they were dated originally.
+
+    Args:
+        items: Archive records. A paper costs a share of one arXiv request, anything else one
+            GET (SSRF guard on, 8 at a time), so callers bound this list.
+
+    Returns:
+        (findings, how many records could be verified). A page that cannot be fetched or
+        states no date is unverifiable, not a finding: no evidence is not evidence of an error.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    papers = arxiv_papers(items)
+    linked = [i for i in items if i.source != PAPER_SOURCE and has_article_page(i)]
+    findings: list[DateFinding] = []
+    verified = 0
+    for arxiv_id, pub in arxiv_first_published(sorted(papers)).items():
+        if arxiv_id in papers:
+            verified += 1
+            if pub.date() != papers[arxiv_id].published.date():   # arXiv is authoritative: no tolerance
+                findings.append(DateFinding(papers[arxiv_id], pub, "arxiv"))
+
+    def stated_date(it: Item) -> tuple[Item, datetime | None]:
+        try:
+            page = http_get(it.url, allow_private=False, accept_types=HTML_TYPES)
+            return it, page_published_date(page.decode("utf-8", errors="replace"))
+        except Exception:
+            return it, None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for it, stated in pool.map(stated_date, linked):
+            verified += stated is not None
+            best = best_publication_date(it.published, stated, date.fromisoformat(it.item_id[:10]))
+            if best.date() != it.published.date():
+                findings.append(DateFinding(it, best, "page"))
+    return findings, verified
+
+
+def report_date_findings(findings: list[DateFinding], verified: int, total: int) -> None:
+    """Log a check's result as a LINT line, naming ids and dates only (never page text)."""
+    log(f"dates: {verified} of {total} record(s) verified against their source, {len(findings)} differ")
+    if findings:
+        shown = "; ".join(f"{f.item.item_id} archived {f.item.published.date()}, {f.evidence} says "
+                          f"{f.expected.date()}" for f in findings[:DATE_CHECK_SHOWN])
+        more = f"; and {len(findings) - DATE_CHECK_SHOWN} more" if len(findings) > DATE_CHECK_SHOWN else ""
+        log(f"LINT archive date differs from the source: {shown}{more}")
+
+
+def daily_date_check(today: date | None = None) -> None:
+    """The scheduled check: every ingest stamp, the newest records, and this day's share of the rest.
+
+    Records are bucketed by a hash of their id, so each one is verified once every
+    DATE_CHECK_CYCLE_DAYS with no state to keep, and any day's share mixes every source and
+    age. The last two days' records are always included, so a source that publishes once a
+    month is checked the day after it lands, not whenever its bucket comes up. It only
+    reports. Advisory like the radar, so a failure here must never stop the run.
+
+    Args:
+        today: The day that picks the bucket; defaults to today (UTC).
+    """
+    today = today or datetime.now(timezone.utc).date()
+    try:
+        items = read_archive()
+        stamped = [i.item_id for i in items if is_ingest_stamp(i)]
+        if stamped:
+            log(f"LINT {len(stamped)} record(s) carry their ingest time as a publication date: "
+                + ", ".join(stamped[:DATE_CHECK_SHOWN]))
+        bucket = today.toordinal() % DATE_CHECK_CYCLE_DAYS
+        recent = (today - timedelta(days=1)).isoformat()
+        share = [i for i in items if i.item_id[:10] >= recent
+                 or zlib.crc32(i.item_id.encode()) % DATE_CHECK_CYCLE_DAYS == bucket]
+        findings, verified = check_dates(share)
+        report_date_findings(findings, verified, len(share))
+    except Exception as exc:
+        log(f"WARN date check failed: {type(exc).__name__}")
+
+
+def correct_archive_dates(findings: list[DateFinding]) -> int:
+    """Rewrite the `- published:` line of each record, and log the change.
+
+    The one sanctioned edit to the otherwise append-only archive. Nothing else in a record
+    changes: the id keeps its run date because claims cite it, and the body stays as fetched.
+    Each change is appended to DATE_CORRECTIONS_PATH with its old value and evidence before
+    the file is replaced, so no change goes unrecorded and every one can be reversed.
+
+    Args:
+        findings: Records to correct.
+
+    Returns:
+        The number of records rewritten.
+    """
+    at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    by_file: dict[str, list[DateFinding]] = {}
+    for f in findings:
+        by_file.setdefault(f.item.item_id[:10], []).append(f)
+    done = 0
+    for run_date, group in sorted(by_file.items()):
+        path = ARCHIVE_DIR / f"{run_date}.md"
+        text = path.read_text()
+        entries: list[str] = []
+        for f in group:
+            head = re.compile(rf"^(### {re.escape(f.item.item_id)}\n(?:- [a-z]+: [^\n]*\n){{3}}- published: )([^\n]*)$",
+                              re.M)
+            m = head.search(text)
+            if not m:
+                log(f"WARN no archive record {f.item.item_id}; left alone")
+                continue
+            entries.append(json.dumps({"id": f.item.item_id, "old": m.group(2), "new": f.expected.isoformat(),
+                                       "evidence": f.evidence, "at": at}))
+            text = text[:m.start(2)] + f.expected.isoformat() + text[m.end(2):]
+        if entries:
+            with DATE_CORRECTIONS_PATH.open("a") as ledger:
+                ledger.write("\n".join(entries) + "\n")
+            atomic_write(path, text)
+            done += len(entries)
+    return done
+
+
+def run_date_check(source: str | None, fix: bool) -> int:
+    """The --check-dates command: verify the archive, optionally correct it and re-store the wiki.
+
+    Args:
+        source: Check only this source; None checks everything, one page fetch per record.
+        fix: Apply the findings. Claims pick up the corrected dates through write_wiki.
+
+    Returns:
+        A process exit code: 1 if records differ and were left as they are, else 0.
+    """
+    items = [i for i in read_archive() if source in (None, i.source)]
+    findings, verified = check_dates(items)
+    report_date_findings(findings, verified, len(items))
+    if findings and fix:
+        log(f"dates: corrected {correct_archive_dates(findings)} record(s); log in {DATE_CORRECTIONS_PATH.name}")
+        write_wiki(read_wiki())
+        commit(datetime.now(timezone.utc).date().isoformat(), 0, message="wiki: correct citation dates")
+    return 1 if findings and not fix else 0
 
 
 def commit(run_date: str, n_items: int, message: str | None = None) -> None:
@@ -3249,7 +3751,12 @@ def main() -> int:
     ap.add_argument("--add-note", metavar="TEXT",
                     help="ingest a piece of knowledge that has no URL (needs --title)")
     ap.add_argument("--title", help="title for --add-note")
-    ap.add_argument("--source", help="override the recorded source name")
+    ap.add_argument("--source", help="override the recorded source name; with --check-dates, "
+                                     "check only this source")
+    ap.add_argument("--check-dates", action="store_true",
+                    help="compare archive dates with arXiv and each article's own page; exits 1 if any differ")
+    ap.add_argument("--fix", action="store_true",
+                    help="with --check-dates, correct the archive and re-store the wiki")
     ap.add_argument("--prune", action="store_true",
                     help="bring an over-cap wiki back under the word cap with dedicated pruning calls")
     ap.add_argument("--radar", action="store_true",
@@ -3275,6 +3782,9 @@ def run(args: argparse.Namespace) -> int:
     override = None
     if args.since:
         override = datetime.strptime(args.since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+    if args.check_dates:
+        return run_date_check(args.source, args.fix)
 
     if args.rebuild_index:
         write_wiki(read_wiki())
@@ -3358,7 +3868,9 @@ def run(args: argparse.Namespace) -> int:
         log(f"  radar: searched {report.queries}, {len(found)} hit(s)")
         all_items.extend(found)
     known_urls = archived_urls()
-    enrich_thin([i for i in all_items if i.url not in known_urls])
+    fresh = [i for i in all_items if i.url not in known_urls]
+    enrich_pages(fresh)
+    date_papers(fresh)
 
     log(f"total {len(all_items)} new items, {failures} source failure(s)")
 
@@ -3367,6 +3879,8 @@ def run(args: argparse.Namespace) -> int:
             log(f"    [{it.slug}] {it.published.date()} {it.title[:70]}")
         log("dry-run: no LLM call, no writes, watermarks unchanged")
         return 0
+
+    daily_date_check()   # before the early returns below, so a quiet day still checks
 
     if not all_items:
         log("nothing new; leaving wiki untouched")
@@ -3422,8 +3936,7 @@ def run(args: argparse.Namespace) -> int:
         log(f"WARN watermark held for {', '.join(held)}: a merge chunk with their items failed, "
             f"so the next run refetches them and merges up to {MAX_SOLO_MERGES} of them alone first")
 
-    updated = prune_to_cap(updated, creds, min_floor=claim_floor(index_md))
-    write_wiki(updated)
+    updated = write_wiki(prune_to_cap(updated, creds, min_floor=claim_floor(index_md)))
     log(f"INDEX.md rewritten: {len(updated.split())} words (cap {WORD_CAP})")
     lint_index(updated, {i.item_id for i in merged_items}, archive_facts())
 
