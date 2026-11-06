@@ -16,6 +16,9 @@ The merge prompt's untrusted block neutralises delimiter variants and spoofed it
 The merge output guard rejects added HTML and id-less bullets; lint reports URLs and shell pipes.
 Small merge batches are quota-capped per source, and the HF papers fetcher selects by listing day.
 The radar filter's reply parser accepts candidate numbers or listed terms, fenced or not.
+Publication dates: what a page states about itself, which date wins, papers dated by arXiv, cards
+bound through their element, citation dates set from the archive on every write, and the date
+check and its corrections to the archive.
 Every test runs against a throwaway directory; the real wiki is never touched.
 
 Run:  python tests/test_ingest.py        (or: pytest tests/)
@@ -24,13 +27,15 @@ Run:  python tests/test_ingest.py        (or: pytest tests/)
 from __future__ import annotations
 
 import contextlib
+import http.client
 import json
 import math
 import os
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 # Point every configurable location at a throwaway dir BEFORE importing the module, so a
@@ -46,7 +51,8 @@ import ai_research as a  # noqa: E402
 import radar  # noqa: E402
 
 PATH_NAMES = ("WIKI_DIR", "INDEX_PATH", "ARCHIVE_DIR", "STATE_PATH", "REVIEWED_PATH", "TOPICS_DIR", "GIT_COMMIT",
-              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "LOCK_PATH", "RETRY_PATH")
+              "DROPPED_PATH", "RECALL_PATH", "WATCHLIST_PATH", "LOCK_PATH", "RETRY_PATH",
+              "DATE_CORRECTIONS_PATH")
 
 
 @contextlib.contextmanager
@@ -65,6 +71,7 @@ def sandbox():
     a.DROPPED_PATH = tmp / "ingest" / "dropped_claims.jsonl"
     a.RECALL_PATH = tmp / "ingest" / "RECALL.md"
     a.RETRY_PATH = tmp / "ingest" / "merge_retry.json"
+    a.DATE_CORRECTIONS_PATH = tmp / "ingest" / "date_corrections.jsonl"
     a.WATCHLIST_PATH = tmp / "watchlist.txt"      # absent unless a test writes one
     a.LOCK_PATH = tmp / "ingest" / "run.lock"
     (tmp / "ingest").mkdir()
@@ -1700,7 +1707,7 @@ def test_load_retry_falls_back_to_empty_on_a_wrong_shape():
 def test_main_gives_up_on_an_item_that_fails_alone_every_run():
     """When every chunk fails the failures are still recorded, so a lone poisoned item stops failing the job."""
     now = datetime.now(timezone.utc)
-    names = ("SOURCES", "FETCHERS", "merge_checked", "load_env", "radar_scan", "enrich_thin",
+    names = ("SOURCES", "FETCHERS", "merge_checked", "load_env", "radar_scan", "enrich_pages",
              "prune_to_cap", "commit", "lint_index")
     saved = {n: getattr(a, n) for n in names}, sys.argv
 
@@ -1715,7 +1722,7 @@ def test_main_gives_up_on_an_item_that_fails_alone_every_run():
         a.merge_checked = reject
         a.load_env = lambda: {}
         a.radar_scan = lambda wiki, creds: a.RadarReport([], [], [])
-        a.enrich_thin = lambda items: None
+        a.enrich_pages = lambda items: None
         a.prune_to_cap = lambda md, creds, min_floor=0: md
         a.commit = lambda *args: None
         a.lint_index = lambda *args, **kw: None
@@ -1963,7 +1970,7 @@ def test_enrich_replaces_thin_bodies_and_ignores_failures():
     fat = a.Item("s", "ab", "t", "https://ok.example/c", datetime.now(timezone.utc), "x" * 800)
     try:
         a.http_get = fake
-        assert a.enrich_thin(items + [fat]) == 1
+        assert a.enrich_pages(items + [fat]) == 1
     finally:
         a.http_get = real
     assert seen_private and not any(seen_private)   # article links come from untrusted feeds: SSRF guard on
@@ -2367,6 +2374,629 @@ class _MonkeyPatch:
     def undo(self) -> None:
         while self._undo:
             self._undo.pop()()
+# ── publication dates ───────────────────────────────────────────────────────
+
+
+def _html(head: str = "", body: str = "<p>text</p>") -> str:
+    return f"<html><head>{head}</head><body>{body}</body></html>"
+
+
+def _ld(obj) -> str:
+    return f'<script type="application/ld+json">{json.dumps(obj)}</script>'
+
+
+def _day(dt: datetime | None) -> str | None:
+    return dt.date().isoformat() if dt else None
+
+
+UTC = timezone.utc
+
+
+def test_parse_date_keeps_the_date_the_source_wrote():
+    """A late-evening stamp stays on its own day: UTC conversion moved a post to the next date."""
+    dt = a.parse_date("2026-10-04T23:28:00-05:00")
+    assert dt.date().isoformat() == "2026-10-04"
+    assert dt == datetime(2026, 10, 5, 4, 28, tzinfo=UTC)          # still the same instant
+    assert a.parse_date("2026-10-04").tzinfo is not None           # no offset: taken as UTC
+    assert a.parse_date("Thu, 05 Nov 2026 19:35:16 GMT").date().isoformat() == "2026-11-05"
+    assert a.parse_date(a.parse_date("2026-10-04T23:28:00-05:00").isoformat()).date().isoformat() == "2026-10-04"
+
+
+def test_page_date_reads_json_ld_nodes_and_publish_meta_tags():
+    """Article-like JSON-LD and the publish-time meta tags are read, in any of the spellings sites use."""
+    ld = _html(_ld({"@context": "https://schema.org", "@type": "BlogPosting", "datePublished": "2026-02-05T10:00:00Z"}))
+    assert _day(a.page_published_date(ld)) == "2026-02-05"
+    graph = _html(_ld({"@graph": [{"@type": "Organization", "name": "x"},
+                                  {"@type": ["Article", "NewsArticle"], "datePublished": "2025-09-29"}]}))
+    assert _day(a.page_published_date(graph)) == "2025-09-29"
+    meta = _html('<meta content="2024-09-19T00:00:00.000Z" property="article:published_time"/>')
+    assert _day(a.page_published_date(meta)) == "2024-09-19"
+    single = _html("<meta name='parsely-pub-date' content='2026-03-01'>")
+    assert _day(a.page_published_date(single)) == "2026-03-01"
+    hugo = _html('<meta property="article:published_time" content="2026-01-02T03:04:05&#43;00:00">')
+    assert _day(a.page_published_date(hugo)) == "2026-01-02"
+    arxiv = _html('<meta name="citation_date" content="2026/02/13"/><meta name="citation_online_date" content="2026/06/14"/>')
+    assert _day(a.page_published_date(arxiv)) == "2026-02-13"       # first version, not the latest revision
+
+
+def test_page_date_refuses_anything_that_is_not_this_pages_publication_date():
+    """Bare time tags, modified dates, comments, and impossible values give no date rather than a wrong one."""
+    assert a.page_published_date(_html(body='<time datetime="2026-01-01">Jan 1, 2026</time>')) is None
+    assert a.page_published_date(_html('<meta property="article:modified_time" content="2026-10-18T21:26:18Z">')) is None
+    assert a.page_published_date(_html(_ld({"@type": "Article", "dateModified": "2026-10-13"}))) is None
+    assert a.page_published_date(_html(_ld({"@type": "Comment", "datePublished": "2026-01-01"}))) is None
+    assert a.page_published_date(_html(_ld({"@type": "Organization", "datePublished": "2011-01-01"}))) is None
+    assert a.page_published_date(_html(_ld({"@type": "Article", "datePublished": "1970-01-01"}))) is None
+    future = (datetime.now(UTC) + timedelta(days=30)).date().isoformat()
+    assert a.page_published_date(_html(_ld({"@type": "Article", "datePublished": future}))) is None
+    assert a.page_published_date(_html(_ld({"@type": "Article", "datePublished": "next Tuesday"}))) is None
+    assert a.page_published_date(_html(_ld({"@type": "Article", "datePublished": ["2026-01-01"]}))) is None
+
+
+def test_page_date_gives_no_date_when_the_page_lists_several_articles():
+    """JSON-LD nodes that disagree are a listing page, so none of them is taken for this page's date."""
+    listing = _html(_ld([{"@type": "Article", "datePublished": "2026-03-05"},
+                         {"@type": "Article", "datePublished": "2026-07-26"}]))
+    assert a.page_published_date(listing) is None
+    same_day = _html(_ld([{"@type": "PodcastEpisode", "datePublished": "2026-09-17T09:00:00Z"},
+                          {"@type": "Article", "datePublished": "2026-09-17T10:00:00Z"}]))
+    assert _day(a.page_published_date(same_day)) == "2026-09-17"
+    listing_with_meta = listing.replace("</head>", '<meta property="article:published_time" content="2026-07-26"></head>')
+    assert _day(a.page_published_date(listing_with_meta)) == "2026-07-26"
+
+
+def test_page_date_survives_hostile_or_broken_markup():
+    """Invalid, truncated, and absurdly nested JSON-LD is skipped, and the meta tags can still answer."""
+    deep = '<script type="application/ld+json">' + "[" * 200000 + "</script>"
+    broken = '<script type="application/ld+json">{"@type": "Article", </script>'
+    meta = '<meta property="article:published_time" content="2026-05-05">'
+    assert a.page_published_date(_html(deep)) is None
+    assert a.page_published_date(_html(broken)) is None
+    assert _day(a.page_published_date(_html(broken + deep + meta))) == "2026-05-05"
+    assert a.page_published_date("") is None
+    assert a.plausible_page_date("2026-05-05" + " " * 100) is None      # refused unparsed
+
+
+def test_page_date_stays_fast_on_a_page_built_to_stall_it():
+    """Floods of unclosed tags take linear time: a quadratic parse would stall the unattended run."""
+    openings = '<script type="application/ld+json">' * 150000
+    no_close = "<script " + "a" * 2000000 + " application/ld+json" * 3
+    giant_tag = "<meta " * 100000 + "<meta " + "a" * 2000000
+    started = time.monotonic()
+    assert a.page_published_date(openings + no_close + giant_tag) is None
+    assert time.monotonic() - started < 5
+
+
+def test_best_publication_date_trusts_earlier_pages_and_ignores_redated_ones():
+    """Which date a record should carry, for each way a feed and a page can differ."""
+    feed = datetime(2026, 10, 13, tzinfo=UTC)
+    seen = date(2026, 10, 14)
+    pick = lambda stated, first=seen: a.best_publication_date(feed, stated, first).date().isoformat()
+    assert pick(None) == "2026-10-13"                                       # nothing stated: keep what we have
+    assert pick(datetime(2026, 4, 15, tzinfo=UTC)) == "2026-04-15"          # restamped feed, late HN submission
+    assert pick(datetime(2026, 10, 12, tzinfo=UTC)) == "2026-10-12"         # even one day earlier
+    assert pick(datetime(2026, 10, 13, tzinfo=UTC)) == "2026-10-13"
+    assert pick(datetime(2026, 10, 14, tzinfo=UTC)) == "2026-10-13"         # one day later is noise
+    assert pick(datetime(2026, 10, 16, tzinfo=UTC), date(2026, 10, 20)) == "2026-10-16"   # read from the wrong element
+    assert pick(datetime(2026, 10, 16, tzinfo=UTC)) == "2026-10-13"         # after we saw it: the page was re-dated
+
+
+def _thin(source: str, url: str, published: datetime | None = None, body: str = "short") -> a.Item:
+    return a.Item(source, "ab", "t", url, published or datetime.now(UTC), body)
+
+
+@contextlib.contextmanager
+def fake_web(pages: dict):
+    """Serve `pages` {url: html} through http_get, recording each call; anything else fails like a 404."""
+    calls: list[tuple[str, bool]] = []
+
+    def get(url, allow_private=True, accept_types=None):
+        calls.append((url, allow_private))
+        if url not in pages:
+            raise OSError("not found")
+        return pages[url].encode()
+    real = a.http_get
+    a.http_get = get
+    try:
+        yield calls
+    finally:
+        a.http_get = real
+
+
+def test_enrich_gives_dateless_restamped_and_hn_items_the_pages_date():
+    """Feed dates that are not publication dates are replaced from the page; sound ones are untouched."""
+    stated = _html(_ld({"@type": "Article", "datePublished": "2026-04-15"}))
+    pages = {"https://x.example/" + n: stated for n in ("nodate", "restamped", "hn", "fat")}
+    pages["https://x.example/agrees"] = _html(_ld({"@type": "Article", "datePublished": "2026-04-15"}))
+    pages["https://x.example/silent"] = _html()
+    fetched_at = datetime.now(UTC)
+    stamp = datetime(2026, 10, 13, 16, 8, tzinfo=UTC)
+    items = {
+        "nodate": _thin("google-dev", "https://x.example/nodate", fetched_at),
+        "restamped": _thin("langchain", "https://x.example/restamped", stamp),
+        "hn": _thin("hackernews", "https://x.example/hn", stamp),
+        "fat": _thin("langchain", "https://x.example/fat", stamp, "x" * 800),
+        "agrees": _thin("aws-ml", "https://x.example/agrees", datetime(2026, 4, 15, 9, 30, tzinfo=UTC)),
+        "silent": _thin("simon-willison", "https://x.example/silent", stamp),
+        "gone": _thin("hackernews", "https://x.example/gone", stamp),
+        "ask": _thin("hackernews", "https://news.ycombinator.com/item?id=1", stamp),
+    }
+    with fake_web(pages) as calls:
+        a.enrich_pages(list(items.values()))
+    for name in ("nodate", "restamped", "hn", "fat"):
+        assert _day(items[name].published) == "2026-04-15", name
+    assert items["agrees"].published == datetime(2026, 4, 15, 9, 30, tzinfo=UTC)   # keeps its exact time
+    assert items["silent"].published == stamp and items["gone"].published == stamp
+    assert items["ask"].published == stamp
+    assert not any("ycombinator" in u for u, _ in calls)
+    assert calls and not any(private for _, private in calls)    # untrusted links: SSRF guard on every fetch
+
+
+def test_enrich_fetches_a_page_once_and_thin_items_come_first_under_the_limit():
+    """A thin item's one GET serves both text and date; the limit spends itself on items that need the text."""
+    prose = "<p>" + "This article explains the technique in useful detail. " * 5 + "</p>"
+    page = _html(_ld({"@type": "Article", "datePublished": "2026-04-15"}), prose)
+    fat = [_thin("s", f"https://x.example/fat{n}", body="x" * 800) for n in range(3)]
+    thin = [_thin("s", f"https://x.example/thin{n}") for n in range(2)]
+    paper = _thin("hf-daily-papers", "https://huggingface.co/papers/2610.00001", body="x" * 800)
+    limit = a.ENRICH_LIMIT
+    a.ENRICH_LIMIT = 3
+    try:
+        with fake_web({i.url: page for i in fat + thin + [paper]}) as calls:
+            assert a.enrich_pages(fat + [paper] + thin) == 2
+    finally:
+        a.ENRICH_LIMIT = limit
+    urls = [u for u, _ in calls]
+    assert sorted(urls) == sorted([thin[0].url, thin[1].url, fat[0].url])
+    assert len(urls) == len(set(urls)) and "useful detail" in thin[0].body
+    assert _day(thin[1].published) == "2026-04-15"
+
+
+def test_enrich_leaves_paper_dates_to_arxiv():
+    """A full abstract costs no page fetch, and a thin paper takes the page's text but not its date."""
+    prose = "<p>" + "This article explains the technique in useful detail. " * 5 + "</p>"
+    page = _html(_ld({"@type": "Article", "datePublished": "2026-01-01"}), prose)
+    listed = datetime(2026, 10, 23, tzinfo=UTC)
+    full = _thin("hf-daily-papers", "https://huggingface.co/papers/2610.00001", listed, "x" * 800)
+    thin = _thin("hf-daily-papers", "https://huggingface.co/papers/2610.00002", listed)
+    with fake_web({full.url: page, thin.url: page}) as calls:
+        a.enrich_pages([full, thin])
+    assert [u for u, _ in calls] == [thin.url]
+    assert "useful detail" in thin.body and thin.published == listed
+
+
+def test_hf_papers_reads_the_papers_date_not_the_entrys_shifted_one():
+    """The entry's publishedAt is the paper's date pushed into the previous day, so the paper's own wins."""
+    today = datetime.now(UTC)
+    body = json.dumps([{"title": "T", "publishedAt": "2026-11-02T19:00:00.000Z",
+                        "paper": {"id": "2611.05275", "publishedAt": "2026-11-03T00:00:00.000Z", "summary": "s"}}])
+    real = a.http_get
+    a.http_get = lambda url: body.encode() if url.endswith(today.date().isoformat()) else b"[]"
+    try:
+        items = a.fetch_hf_papers("hf-daily-papers", "hf", "https://example/api", today)
+    finally:
+        a.http_get = real
+    assert _day(items[0].published) == "2026-11-03"
+
+
+ARXIV_FEED = """<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">
+<entry><id>http://arxiv.org/abs/2610.00854v3</id><published>2026-10-01T00:14:50Z</published>
+<updated>2026-10-23T14:22:06Z</updated></entry>
+<entry><id>https://arxiv.org/api/errors#bad</id><title>Error</title></entry>
+</feed>"""
+
+
+def test_date_papers_uses_the_first_arxiv_version_and_keeps_the_date_when_arxiv_has_no_answer():
+    """A revised paper gets its v1 date; a paper arXiv does not answer for, and any non-paper, is untouched."""
+    listed = datetime(2026, 10, 23, tzinfo=UTC)
+    revised = _thin("hf-daily-papers", "https://huggingface.co/papers/2610.00854", listed)
+    unknown = _thin("hf-daily-papers", "https://huggingface.co/papers/2610.99999", listed)
+    odd = _thin("hf-daily-papers", "https://huggingface.co/papers/not-an-id%26x", listed)
+    blog = _thin("hf-blog", "https://huggingface.co/papers/2610.00854", listed)
+    requested: list[str] = []
+    real = a.http_get
+
+    def get(url):
+        requested.append(url)
+        return ARXIV_FEED.encode()
+    a.http_get = get
+    try:
+        with capture_logs() as logs:
+            assert a.date_papers([revised, unknown, odd, blog]) == 1
+    finally:
+        a.http_get = real
+    assert _day(revised.published) == "2026-10-01"
+    assert unknown.published == listed and odd.published == listed and blog.published == listed
+    assert len(requested) == 1 and requested[0].startswith(a.ARXIV_API) and "not-an-id" not in requested[0]
+    assert any("keep Hugging Face" in ln for ln in logs)
+
+
+def test_arxiv_failure_is_logged_and_never_raises():
+    """An arXiv outage, or a reply that is not XML, costs the lookup and nothing else."""
+    real = a.http_get
+
+    def down(url):
+        raise OSError("unreachable")
+
+    def cut_off(url):
+        raise http.client.IncompleteRead(b"")    # not an OSError, and it reaches here from resp.read()
+    for get in (down, cut_off, lambda url: b"<not xml"):
+        a.http_get = get
+        try:
+            with capture_logs() as logs:
+                assert a.arxiv_first_published(["2610.00001"]) == {}
+        finally:
+            a.http_get = real
+        assert any("WARN arxiv" in ln for ln in logs)
+
+
+def test_arxiv_lookup_is_batched_and_paced():
+    """Ids go in batches, with the pause arXiv asks for between requests."""
+    requested: list[str] = []
+    pauses: list[int] = []
+    real_get, real_sleep = a.http_get, a.time.sleep
+
+    def get(url):
+        requested.append(url)
+        return b'<feed xmlns="http://www.w3.org/2005/Atom"></feed>'
+    a.http_get, a.time.sleep = get, pauses.append
+    try:
+        a.arxiv_first_published([f"2610.{n:05d}" for n in range(a.ARXIV_BATCH * 2 + 1)])
+    finally:
+        a.http_get, a.time.sleep = real_get, real_sleep
+    assert len(requested) == 3 and pauses == [a.ARXIV_PAUSE_SECONDS] * 2
+
+
+def _redesigned_card(path: str, title: str, date_text: str) -> str:
+    """A card as the Anthropic index has rendered it since 2026-10: the date comes before the link."""
+    return (f'<article class="x" data-listing-row="y"><header><button aria-label="Related to {title}"></button>'
+            f'<time>{date_text}</time></header><figure><img alt=""/></figure>'
+            f'<div><h3><a class="t" href="{path}">{title}</a></h3></div></article>\n')
+
+
+def test_index_cards_bind_a_date_to_its_own_article_in_either_order():
+    """A date binds through its <article> element, so neither neighbour can lend a card its date."""
+    newest_first = "".join(_redesigned_card(p, t, d) for p, t, d in (
+        ("/research/newest", "Newest", "Oct 13, 2026"),
+        ("/research/Mixed-Case-Slug", "Mixed", "Jan 21, 2026"),
+        ("/engineering/oldest", "Oldest", "Sep 19, 2024")))
+    got = {p: _day(d) for p, d in a.index_card_dates(newest_first).items()}
+    assert got == {"/research/newest": "2026-10-13", "/research/Mixed-Case-Slug": "2026-01-21",
+                   "/engineering/oldest": "2024-09-19"}
+    # Cards this code cannot read with certainty are left out, not guessed at.
+    undated = '<article><a href="/research/a">A</a></article>' + _redesigned_card("/research/b", "B", "Oct 1, 2026")
+    assert set(a.index_card_dates(undated)) == {"/research/b"}
+    two_dates = '<article><time>Oct 1, 2026</time><a href="/research/a">A</a><p>Updated Oct 9, 2026</p></article>'
+    assert a.index_card_dates(two_dates) == {}
+    two_links = '<article><time>Oct 1, 2026</time><a href="/research/a">A</a><a href="/research/b">B</a></article>'
+    assert a.index_card_dates(two_links) == {}
+    outside = '<a href="/research/a">A</a><time>Oct 1, 2026</time>'
+    assert a.index_card_dates(outside) == {}
+
+
+ARTICLE_BODY = "<p>" + "This sentence is long enough to count as article prose rather than navigation chrome. " * 3 + "</p>"
+
+
+def _fetch_index(pages: dict, archived: set[str], merged: set[str] | None = None) -> list[a.Item]:
+    """Run fetch_html_index with `archived` on record, of which `merged` (default: all) a merge has seen."""
+    real, real_finished = a.archived_urls, a.finished_urls
+    a.archived_urls = lambda: archived
+    a.finished_urls = lambda: archived if merged is None else merged
+    try:
+        with fake_web(pages):
+            return a.fetch_html_index("anthropic-eng", "ae", "https://www.anthropic.com/engineering",
+                                      datetime(2000, 1, 1, tzinfo=UTC))
+    finally:
+        a.archived_urls, a.finished_urls = real, real_finished
+
+
+def test_html_index_takes_the_articles_own_date_and_skips_articles_that_moved():
+    """A post archived under /engineering/ is not new under /research/; a new one is dated by its own page."""
+    base = "https://www.anthropic.com"
+    index = (_redesigned_card("/research/new-post", "New", "Oct 13, 2026")
+             + _redesigned_card("/research/old-post", "Old", "Sep 29, 2025"))
+    article = _html('<meta property="article:published_time" content="2026-10-13T00:00:00.000Z"/>',
+                    "<h1>New post</h1>" + ARTICLE_BODY * 3)
+    pages = {base + "/engineering": index, base + "/research/new-post": article}
+    with capture_logs() as logs:
+        items = _fetch_index(pages, {base + "/engineering/old-post"})
+    assert [i.url for i in items] == [base + "/research/new-post"]
+    assert _day(items[0].published) == "2026-10-13" and items[0].title == "New post"
+    assert not any("WARN" in ln for ln in logs)
+
+
+def test_html_index_reoffers_an_unmerged_article_under_the_url_it_was_archived_with():
+    """A moved article no merge has seen is fetched again, keeping its old URL so it is not archived twice."""
+    base = "https://www.anthropic.com"
+    index = _redesigned_card("/research/moved", "Moved", "Sep 29, 2025")
+    article = _html('<meta property="article:published_time" content="2025-09-29"/>', ARTICLE_BODY * 3)
+    pages = {base + "/engineering": index, base + "/research/moved": article}
+    items = _fetch_index(pages, {base + "/engineering/moved"}, merged=set())
+    assert [i.url for i in items] == [base + "/engineering/moved"]
+
+
+def test_html_index_warns_when_a_page_and_its_card_disagree():
+    """Two independent readings that differ mean a parser broke: the page wins, and the log says so."""
+    base = "https://www.anthropic.com"
+    pages = {base + "/engineering": _redesigned_card("/research/post", "Post", "Oct 16, 2025"),
+             base + "/research/post": _html('<meta property="article:published_time" content="2025-09-29"/>',
+                                            ARTICLE_BODY * 3)}
+    with capture_logs() as logs:
+        items = _fetch_index(pages, set())
+    assert _day(items[0].published) == "2025-09-29"
+    assert any("WARN" in ln and "2025-09-29" in ln and "2025-10-16" in ln for ln in logs)
+
+
+def test_html_index_falls_back_to_the_card_and_then_says_it_has_no_date():
+    """A page with no metadata takes its card's date; with neither, the log names the article."""
+    base = "https://www.anthropic.com"
+    pages = {base + "/engineering": _redesigned_card("/research/post", "Post", "Oct 16, 2025"),
+             base + "/research/post": _html(body=ARTICLE_BODY * 3)}
+    assert _day(_fetch_index(pages, set())[0].published) == "2025-10-16"
+    pages[base + "/engineering"] = '<a href="/research/post">Post</a>'
+    with capture_logs() as logs:
+        _fetch_index(pages, set())
+    assert any("no publication date" in ln and "/research/post" in ln for ln in logs)
+
+
+def test_html_index_with_no_links_fails_instead_of_reporting_nothing_new():
+    """An index the pattern cannot read is a failure, or a redesign goes unnoticed for weeks."""
+    base = "https://www.anthropic.com"
+    try:
+        _fetch_index({base + "/engineering": "<html><body>Redesigned</body></html>"}, set())
+    except RuntimeError as exc:
+        assert "no article links" in str(exc)
+    else:
+        raise AssertionError("an unreadable index must raise")
+
+
+def test_add_url_prefers_metadata_over_the_first_date_on_the_page():
+    """A banner date is not a publication date; metadata is used when present and text only as a last resort."""
+    url = "https://x.example/post"
+    banner = "<p>Nov 05 2026</p>" + ARTICLE_BODY
+    real_check = a.check_url
+    a.check_url = lambda *_, **__: None
+    try:
+        with fake_web({url: _html(_ld({"@type": "Article", "datePublished": "2026-04-15"}), banner)}):
+            assert _day(a.fetch_one_url(url, None).published) == "2026-04-15"
+        with fake_web({url: _html(body=banner)}), capture_logs() as logs:
+            assert _day(a.fetch_one_url(url, None).published) == "2026-11-05"
+        assert any("no publication date" in ln for ln in logs)
+    finally:
+        a.check_url = real_check
+
+
+def test_reoffered_item_is_shown_to_the_merge_with_the_archived_date():
+    """A refetched item keeps the archive's date, so a dateless feed cannot pass off today as its date."""
+    with sandbox():
+        first = a.Item("src", "gd", "t", "https://x/a", datetime(2026, 4, 15, tzinfo=UTC), "body")
+        a.write_archive([first], "2026-10-22")
+        again = a.Item("src", "gd", "t", "https://x/a", datetime.now(UTC), "body")
+        a.write_archive([again], "2026-11-04")
+        assert again.item_id == first.item_id and _day(again.published) == "2026-04-15"
+
+
+# ── citation dates ──────────────────────────────────────────────────────────
+
+
+FACTS = {"2026-08-29-ae-02": ("2024-12-19", True), "2026-11-02-sw-02": ("2026-11-01", True),
+         "2026-10-07-hn-17": ("2026-10-05", True)}
+
+
+def test_sync_claim_dates_sets_each_citation_from_the_archive():
+    """A retyped date is replaced, a multi-source claim takes its newest source, and prose is untouched."""
+    md = ("## S\n\n- Year flipped 2026-01-06 stays in prose. — anthropic-eng, 2026-01-06 [2026-08-29-ae-02]\n"
+          "- Run date copied from the id. — simon-willison, 2026-11-02 [2026-11-02-sw-02]\n"
+          "- Two sources. — x, 2026-10-07 [2026-08-29-ae-02, 2026-10-07-hn-17]\n"
+          "- Right already. — x, 2026-11-01 [2026-11-02-sw-02]\n"
+          "- Both sides. — a, 2026-01-01 [2026-08-29-ae-02] vs — b, 2026-01-02 [2026-11-02-sw-02]\n"
+          "- Invented id left for lint. — x, 2026-01-01 [2026-09-09-zz-77]\n"
+          "Not a claim 2026-01-06 [2026-08-29-ae-02]\n")
+    got = a.sync_claim_dates(md, FACTS)
+    assert "— anthropic-eng, 2024-12-19 [2026-08-29-ae-02]" in got and "Year flipped 2026-01-06 stays" in got
+    assert "— simon-willison, 2026-11-01 [2026-11-02-sw-02]" in got
+    assert "— x, 2026-10-05 [2026-08-29-ae-02, 2026-10-07-hn-17]" in got
+    assert "— a, 2024-12-19 [2026-08-29-ae-02] vs — b, 2026-11-01 [2026-11-02-sw-02]" in got
+    assert "— x, 2026-01-01 [2026-09-09-zz-77]" in got
+    assert "Not a claim 2026-01-06 [2026-08-29-ae-02]" in got
+    assert a.sync_claim_dates(got, FACTS) == got
+    assert a.sync_claim_dates(md, {}) == md
+
+
+def test_every_write_of_the_wiki_stores_archive_dates_and_returns_them():
+    """write_wiki is the one path to disk, so a bad date cannot be stored and callers lint what was stored."""
+    with sandbox():
+        rec = a.Item("src", "ae", "t", "https://x/a", datetime(2024, 12, 19, tzinfo=UTC), "body")
+        a.write_archive([rec], "2026-08-29")
+        md = f"## S\n\n- A claim. — src, 2026-01-06 [{rec.item_id}]\n"
+        stored = a.write_wiki(md)
+        assert f"2024-12-19 [{rec.item_id}]" in stored and "2026-01-06" not in a.read_wiki()
+        assert lint_lines(stored, {rec.item_id}, a.archive_facts()) == []
+
+
+def test_lint_checks_multi_source_dates_and_reports_attributions_it_cannot_read():
+    """The newest source decides a multi-id claim, and ids with no `date [ids]` shape are reported."""
+    wrong = "## S\n\n- Two sources. — x, 2026-10-07 [2026-08-29-ae-02, 2026-10-07-hn-17]\n"
+    problems = lint_lines(wrong, set(), FACTS)
+    assert any("cited 2026-10-07, archived 2026-10-05" in p for p in problems), problems
+    right = wrong.replace("2026-10-07 [", "2026-10-05 [")
+    assert lint_lines(right, set(), FACTS) == []
+    shapeless = "## S\n\n- No date before the ids. — x [2026-08-29-ae-02]\n"
+    assert any("cannot be checked" in p for p in lint_lines(shapeless, set(), FACTS))
+
+
+# ── date check ──────────────────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def stub_arxiv(dates: dict):
+    """Answer arxiv_first_published from `dates` {id: datetime}."""
+    real = a.arxiv_first_published
+    a.arxiv_first_published = lambda ids: {i: dates[i] for i in ids if i in dates}
+    try:
+        yield
+    finally:
+        a.arxiv_first_published = real
+
+
+def _record(run_date: str, n: int, source: str, url: str, published: datetime, slug: str = "ab") -> a.Item:
+    it = a.Item(source, slug, "A title with\na newline", url, published, "body")
+    it.item_id = f"{run_date}-{slug}-{n:02d}"
+    return it
+
+
+def test_check_dates_finds_records_that_disagree_with_their_source():
+    """Each kind of wrong date is found: a neighbour's date, a restamp, a one-day-early paper, a late one."""
+    stated = lambda iso: _html(_ld({"@type": "Article", "datePublished": iso}))
+    card = _record("2026-08-29", 1, "anthropic-eng", "https://x.example/card", datetime(2025, 10, 16, tzinfo=UTC))
+    stamp = _record("2026-10-22", 2, "langchain", "https://x.example/stamp", datetime(2026, 10, 13, tzinfo=UTC))
+    sound = _record("2026-10-22", 3, "aws-ml", "https://x.example/sound", datetime(2026, 10, 20, tzinfo=UTC))
+    early = _record("2026-08-28", 4, "hf-daily-papers", "https://huggingface.co/papers/2608.00001",
+                    datetime(2026, 8, 17, 20, tzinfo=UTC))
+    right = _record("2026-08-28", 5, "hf-daily-papers", "https://huggingface.co/papers/2608.00002",
+                    datetime(2026, 8, 18, 5, tzinfo=UTC))
+    pages = {"https://x.example/card": stated("2025-09-29"), "https://x.example/stamp": stated("2026-04-15"),
+             "https://x.example/sound": stated("2026-10-20")}
+    papers = {"2608.00001": datetime(2026, 8, 18, 9, tzinfo=UTC), "2608.00002": datetime(2026, 8, 18, 23, tzinfo=UTC)}
+    with fake_web(pages) as calls, stub_arxiv(papers):
+        findings, verified = a.check_dates([card, stamp, sound, early, right])
+    got = {f.item.item_id: (_day(f.expected), f.evidence) for f in findings}
+    assert got == {card.item_id: ("2025-09-29", "page"), stamp.item_id: ("2026-04-15", "page"),
+                   early.item_id: ("2026-08-18", "arxiv")}
+    assert verified == 5
+    assert calls and not any(private for _, private in calls)     # archive URLs came from feeds: SSRF guard on
+
+
+def test_check_dates_does_not_call_missing_evidence_or_a_redated_page_an_error():
+    """Unreachable pages, pages with no date, notes, and re-dated pages are not findings."""
+    when = datetime(2026, 9, 14, tzinfo=UTC)
+    redated = _record("2026-09-15", 1, "latent-space", "https://x.example/redated", when)
+    silent = _record("2026-09-15", 2, "simon-willison", "https://x.example/silent", when)
+    gone = _record("2026-09-15", 3, "openai-blog", "https://x.example/gone", when)
+    note = _record("2026-09-15", 4, "synthesis", "", when)
+    ask = _record("2026-09-15", 5, "hackernews", "https://news.ycombinator.com/item?id=1", when)
+    paper = _record("2026-09-15", 6, "hf-daily-papers", "https://huggingface.co/papers/2609.00001", when)
+    pages = {"https://x.example/redated": _html(_ld({"@type": "Article", "datePublished": "2026-09-17"})),
+             "https://x.example/silent": _html()}
+    with fake_web(pages) as calls, stub_arxiv({}):
+        findings, verified = a.check_dates([redated, silent, gone, note, ask, paper])
+    assert findings == [] and verified == 1
+    assert not any("ycombinator" in u for u, _ in calls)
+
+
+def test_ingest_stamps_are_recognised_and_notes_are_exempt():
+    """The now() fallback is detectable, and a note's own writing date is not mistaken for it."""
+    run = "2026-10-22"
+    stamp = datetime(2026, 10, 22, 11, 2, 3, 456789, tzinfo=UTC)
+    assert a.is_ingest_stamp(_record(run, 1, "google-dev", "https://x/a", stamp))
+    assert not a.is_ingest_stamp(_record(run, 2, "synthesis", "", stamp))
+    assert not a.is_ingest_stamp(_record(run, 3, "aws-ml", "https://x/b", stamp.replace(microsecond=0)))
+    assert not a.is_ingest_stamp(_record("2026-10-23", 4, "aws-ml", "https://x/c", stamp))
+
+
+def test_daily_check_covers_every_record_once_per_cycle_and_reports_stamps():
+    """Over one cycle each record is checked exactly once, and an ingest stamp is reported every day."""
+    with sandbox():
+        recs = [a.Item("src", "ab", "t", f"https://x/{n}", datetime(2026, 1, 1, tzinfo=UTC), "b") for n in range(120)]
+        recs.append(a.Item("src", "gd", "t", "https://x/stamped", datetime(2026, 10, 2, 1, 1, 1, 5, tzinfo=UTC), "b"))
+        a.write_archive(recs, "2026-10-02")
+        seen: list[str] = []
+        real = a.check_dates
+        a.check_dates = lambda items: (seen.extend(i.item_id for i in items), ([], len(items)))[1]
+        try:
+            with capture_logs() as logs:
+                for day in range(a.DATE_CHECK_CYCLE_DAYS):
+                    a.daily_date_check(date(2026, 11, 1) + timedelta(days=day))
+        finally:
+            a.check_dates = real
+        assert sorted(seen) == sorted(i.item_id for i in recs)
+        assert sum("LINT 1 record(s) carry their ingest time" in ln for ln in logs) == a.DATE_CHECK_CYCLE_DAYS
+
+
+def test_daily_check_always_includes_the_newest_records():
+    """A record from the last two days is checked now, whatever its bucket, so rare sources are not missed."""
+    with sandbox():
+        recs = [a.Item("src", "ab", "t", f"https://x/{n}", datetime(2026, 1, 1, tzinfo=UTC), "b") for n in range(40)]
+        a.write_archive(recs, "2026-11-04")
+        older = a.Item("src", "ab", "t", "https://x/older", datetime(2026, 1, 1, tzinfo=UTC), "b")
+        a.write_archive([older], "2026-11-02")
+        seen: list[str] = []
+        real = a.check_dates
+        a.check_dates = lambda items: (seen.extend(i.item_id for i in items), ([], len(items)))[1]
+        try:
+            with capture_logs():
+                a.daily_date_check(date(2026, 11, 5))
+        finally:
+            a.check_dates = real
+        assert {i.item_id for i in recs} <= set(seen)
+
+
+def test_daily_check_failure_never_stops_the_run():
+    """The check is advisory: anything that goes wrong is one WARN line."""
+    real = a.read_archive
+
+    def broken():
+        raise ValueError("secret page text")
+    a.read_archive = broken
+    try:
+        with capture_logs() as logs:
+            a.daily_date_check()
+    finally:
+        a.read_archive = real
+    assert any("WARN date check failed: ValueError" in ln for ln in logs)
+    assert not any("secret" in ln for ln in logs)                 # the type, never the message
+
+
+def test_date_findings_are_logged_as_ids_and_dates_without_page_text():
+    """A finding names the record and two dates; the title, which an outsider wrote, stays out of the log."""
+    rec = _record("2026-08-29", 1, "anthropic-eng", "https://x.example/a", datetime(2025, 10, 16, tzinfo=UTC))
+    many = [a.DateFinding(rec, datetime(2025, 9, 29, tzinfo=UTC), "page")] * (a.DATE_CHECK_SHOWN + 3)
+    with capture_logs() as logs:
+        a.report_date_findings(many, 20, 40)
+    line = next(ln for ln in logs if ln.startswith("LINT "))
+    assert f"{rec.item_id} archived 2025-10-16, page says 2025-09-29" in line and line.endswith("and 3 more")
+    assert not any("title" in ln or "x.example" in ln for ln in logs)
+
+
+def test_correct_archive_dates_changes_only_the_published_line_and_records_it():
+    """A correction touches one line of one record, survives a re-read, and leaves a reversible ledger entry."""
+    with sandbox():
+        target = a.Item("src", "ae", "T", "https://x/a", datetime(2025, 10, 16, tzinfo=UTC),
+                        "- published: 1999-01-01\nA body line that looks like a header.")
+        other = a.Item("src", "ae", "U", "https://x/b", datetime(2025, 10, 20, tzinfo=UTC), "other body")
+        a.write_archive([target, other], "2026-08-29")
+        path = a.ARCHIVE_DIR / "2026-08-29.md"
+        before = path.read_text().splitlines()
+        fixed = a.correct_archive_dates([a.DateFinding(target, datetime(2025, 9, 29, tzinfo=UTC), "page"),
+                                         a.DateFinding(_record("2026-08-29", 77, "s", "u", target.published), target.published, "page")])
+        assert fixed == 1
+        after = path.read_text().splitlines()
+        assert [(x, y) for x, y in zip(before, after) if x != y] == [
+            ("- published: 2025-10-16T00:00:00+00:00", "- published: 2025-09-29T00:00:00+00:00")]
+        assert len(before) == len(after)
+        got = {i.item_id: i for i in a.read_archive()}
+        assert _day(got[target.item_id].published) == "2025-09-29" and got[target.item_id].body == target.body
+        assert _day(got[other.item_id].published) == "2025-10-20"
+        entry = json.loads(a.DATE_CORRECTIONS_PATH.read_text())
+        assert (entry["id"], entry["old"], entry["evidence"]) == (target.item_id, "2025-10-16T00:00:00+00:00", "page")
+        assert not list(a.ARCHIVE_DIR.glob("*.tmp"))
+
+
+def test_fix_command_corrects_the_archive_carries_it_into_the_wiki_and_then_finds_nothing():
+    """--check-dates --fix end to end, then a second pass over the corrected archive comes back clean."""
+    with sandbox():
+        rec = a.Item("anthropic-eng", "ae", "T", "https://x.example/a", datetime(2025, 10, 16, tzinfo=UTC), "body")
+        a.write_archive([rec], "2026-08-29")
+        a.write_wiki(f"## S\n\n- A claim. — anthropic-eng, 2025-10-16 [{rec.item_id}]\n")
+        pages = {rec.url: _html(_ld({"@type": "Article", "datePublished": "2025-09-29T00:00:00.000Z"}))}
+        with fake_web(pages), stub_arxiv({}):
+            assert a.run_date_check(None, fix=False) == 1           # reported, exit code says so
+            assert "2025-10-16" in a.read_wiki() and not a.DATE_CORRECTIONS_PATH.exists()
+            assert a.run_date_check("some-other-source", fix=False) == 0
+            assert a.run_date_check(None, fix=True) == 0
+            assert a.run_date_check(None, fix=False) == 0           # idempotent
+        assert f"2025-09-29 [{rec.item_id}]" in a.read_wiki()
+        assert len(a.DATE_CORRECTIONS_PATH.read_text().splitlines()) == 1
 
 
 if __name__ == "__main__":

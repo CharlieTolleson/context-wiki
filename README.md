@@ -15,7 +15,8 @@ sources: ~20 RSS/Atom feeds (practitioners + vendor engineering blogs), Hacker N
          HF papers, Anthropic engineering blog
    |   date watermark per source: only items newer than the last successful pull
    |   + coverage radar: targeted searches for concepts the wiki is missing (see below)
-   |   + thin items get the linked page's text fetched
+   |   + each new item's page is fetched once: thin items get its text, every item its stated
+   |     publication date (feed dates are only claims); papers are dated by arXiv
    v
 archive/YYYY-MM-DD.md     every item in full, with a stable id like 2026-10-07-sw-03   (append-only)
    |
@@ -37,7 +38,10 @@ Design decisions worth knowing:
 - **Chunked merging.** Items go to the model 15 at a time, each chunk merging into the result of the last. One 60-item prompt made the model either rewrite the wiki wholesale (tripping the guards) or ignore the new items. A chunk the guards reject is skipped, and the sources of its items keep their old watermark so the next run refetches them (the Anthropic corpus, which has no watermark, refetches any archived article no merge has seen yet), ranks them ahead of new items for their source's quota, and merges up to four of them alone, one per call, before the usual chunks. The guards reject a whole chunk, so only a guard refusal of an item merged alone counts against it (a connection error or timeout does not): one refused alone twice is given up on (`ingest/merge_retry.json`) and left to `--backfill`, so one poisoned item cannot sink a chunk every day and its chunk-mates are not given up with it.
 - **Pruning by deletion.** The word cap is enforced in code. When the wiki is over it, the model is shown the numbered claims and returns only the numbers to delete; the code deletes them, so every surviving claim is byte-for-byte unchanged, and never deletes the sole claim covering a watchlist concept. (Asking the model to retype a shorter wiki cut whole topics at random.)
 - **Topic files.** A section over 500 words moves to `topics/<slug>.md` and `INDEX.md` keeps a one-line pointer (claim count, last updated, scope). Small sections stay inline. This is purely storage: the merge always sees one assembled document. A topic file nothing points at any more is deleted only if it carries the generated-file header, so notes of your own in `topics/` are never touched.
-- **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, single-source claims whose date differs from the archive's, claims built on an item that was archived without a body, claims that lead with a research-artifact name instead of a practice, and bullets containing a URL, a pipe into a shell (`| sh`, `| bash`), HTML, or no item id. The archive is the ground truth for ids and dates. Reported, never auto-fixed.
+- **Lint.** Reports duplicate item ids, ids the model invented, cap overruns, claims whose date differs from the archive's, claims built on an item that was archived without a body, claims that lead with a research-artifact name instead of a practice, and bullets containing a URL, a pipe into a shell (`| sh`, `| bash`), HTML, or no item id. The archive is the ground truth for ids and dates. Reported, never auto-fixed, except citation dates, which are derived data: see below.
+- **Publication dates come from the article.** A feed's date is a claim, not a fact: Hacker News dates the submission, LangChain's feed restamps a post on every edit, Google's feed has no dates, and Hugging Face follows the latest paper revision. So each new item's page is fetched and the date it states in structured metadata (JSON-LD, `article:published_time`) is used when it is earlier; a page date later than the item's first sighting is a re-dated page and is ignored. Papers take the first version's date from arXiv. Only metadata is read: on the archive, a page's first bare `<time>` element was right just 81% of the time. A page with no metadata keeps the feed's date.
+- **Citation dates are computed.** Every write of the wiki sets each claim's date from the archive (its item's date, or its newest source's). The model retypes dates on every merge and has written the run date from the id and changed a year, so its copy never survives.
+- **Date check.** Lint compares the wiki with the archive, so it cannot see an archive that is itself wrong. `--check-dates` compares the archive with the sources, and every run does this for the last two days' records plus a thirtieth of the rest (a hash of the id picks the day, so each record is verified monthly and any day's share mixes all sources). Findings appear as `LINT` lines. `--fix` corrects them: the only edit ever made to an archive record, limited to its `published` line, logged with the old value to `date_corrections.jsonl`.
 - **Untrusted input.** Feed titles and bodies are wrapped in an explicit "data, not instructions" block before they reach the model.
 
 ## Requirements
@@ -81,6 +85,9 @@ The first run looks back 14 days (`LOOKBACK_CAP_DAYS`) and writes `INDEX.md`, `a
 | `--add-note TEXT --title TITLE [--source NAME]` | Store a finding that has no URL (something you learned yourself) |
 | `--radar` | Print the coverage report (watchlist gaps, emerging terms, recent removals) and write `RECALL.md` |
 | `--prune` | Bring an over-cap wiki back under the word cap by model-selected deletion |
+| `--check-dates` | Compare archive dates with arXiv and each article's own page. Exits 1 if any differ. No LLM call. A full pass is one page fetch per record |
+| `--check-dates --source NAME` | Same, for one source |
+| `--check-dates --fix` | Also correct the archive, log each change to `date_corrections.jsonl`, and re-store the wiki with the corrected citation dates |
 | `--rebuild-index` | Re-store the wiki through the topic-file layout. No fetching, no LLM call |
 
 Manual adds follow exactly the same rules as the scheduled job: the same inclusion test, merge rules, word cap, and attribution format. Do not edit `INDEX.md` or `topics/` by hand; the next merge will overwrite your edit.
@@ -123,7 +130,8 @@ Constants at the top of `ingest/ai_research.py`:
 | `LOOKBACK_CAP_DAYS` | `14` | Longest backfill after an outage |
 | `TOPIC_META` | 7 sections | Section titles, file slugs, and one-line scopes. Sections the model invents are handled too |
 | `MERGE_CHUNK` | `15` | Items per merge call |
-| `ENRICH_LIMIT`, `ENRICH_MIN_BODY` | 40, 500 | Thin items (body under 500 characters) get the linked page fetched, up to 40 per run |
+| `ENRICH_LIMIT`, `ENRICH_MIN_BODY` | 80, 500 | Pages fetched per run for text and dates, thin items (body under 500 characters) first |
+| `DATE_CHECK_CYCLE_DAYS` | `30` | Each run verifies this fraction of the older archive, so every record once a cycle |
 | `HN_QUERIES`, `HN_MIN_POINTS` | 16 topics, 75 | Hacker News is queried by topic, not by front page |
 
 The merge prompt is the `MERGE_SYSTEM` string. Tune it for your own definition of "worth keeping". Keep its few-shot examples fictional (they use made-up "Acme" names and say so): a real artifact name in an example tends to come back as a wiki claim, cited against whatever item looked closest.
@@ -200,12 +208,13 @@ To keep that history, point `WIKI_DATA_DIR` at a folder in a **private** repo (o
 .venv/bin/python tests/test_ingest.py     # offline: no network, no LLM calls
 ```
 
-They cover the shrink guard and its retry, the output guard (HTML and id-less bullets), the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, per-source quotas on small batches, the papers fetcher, the lint's checks against the archive (fabricated ids, changed dates, bodiless sources, artifact names), commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
+They cover the shrink guard and its retry, the output guard (HTML and id-less bullets), the radar and watchlist guard, chunked merging, deletion-based pruning, feed repair and page enrichment, archive de-duplication and re-offering of unmerged items, per-source quotas on small batches, the papers fetcher, the lint's checks against the archive (fabricated ids, changed dates, bodiless sources, artifact names), commit scoping and the commit switch, settings precedence, the topic-file split (including a round trip, the missing-file safety check, and the rejection of pointers that lead outside `topics/`), URL safety for fetches, and the date binding of the `html_index` scraper (each article takes the date from its own card), and the merge prompt's examples (fictional names, marked as illustrations), and publication dates (what a page states, which date wins, arXiv dating, citation dates set on every write, and the date check with its corrections). The suite points every location at a temp directory before importing, so it cannot touch a real wiki.
 
 ## Known limitations
 
-- **Page enrichment is best effort.** Thin items get the linked page's text, but paywalled, JavaScript-rendered, or blocking sites leave the original teaser, and at most 40 items are fetched per run.
+- **Page enrichment is best effort.** Thin items get the linked page's text and all items its date, but paywalled, JavaScript-rendered, or blocking sites leave the original teaser and feed date, and at most 80 pages are fetched per run.
+- **Not every date can be verified.** A page with no structured metadata, or one that refuses scripts, says nothing to the date check, so that record is skipped rather than flagged. For Hacker News items that means the submission date stands. Simon Willison's and Martin Fowler's pages carry no metadata, though their feed dates held up when checked by hand against URLs and page text.
 - **Some sites block scripted fetches.** `openai.com/blog` returns 403 to plain HTTP clients, and its working news feed is mostly customer stories, so OpenAI is not a source. The Anthropic news page has no feed either.
 - **The emerging-term detector is statistical and modest.** It needs a term to appear in two or three archive items on different days, so a concept mentioned once is invisible to it; the watchlist and the vendor-blog sources are the main defence, and the detector is the net under them.
-- **Merge quality depends on the model.** Lint reports the failures a model keeps making (duplicate ids, artifact-name bullets, a citation date the model changed); it does not fix them. The artifact-name check keeps a small allowlist (`ARTIFACT_ALLOWLIST`) for products and generic terms that legitimately head a practice.
+- **Merge quality depends on the model.** Lint reports the failures a model keeps making (duplicate ids, artifact-name bullets); it does not fix them. The artifact-name check keeps a small allowlist (`ARTIFACT_ALLOWLIST`) for products and generic terms that legitimately head a practice.
 - **No license file yet.** Until one is added, the default is all rights reserved.
